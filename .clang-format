@@ -1,0 +1,46 @@
+---
+Language: Cpp
+BasedOnStyle: Google
+
+# 基础格式控制
+IndentWidth: 4
+TabWidth: 4
+ColumnLimit: 120
+MaxEmptyLinesToKeep: 1
+
+# 严格禁止短行（增加代码纵向整齐度）
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: false
+AllowShortLoopsOnASingleLine: false
+
+# 模板和对齐
+AlwaysBreakTemplateDeclarations: true
+PointerAlignment: Left
+ReferenceAlignment: Left
+DerivePointerAlignment: false
+
+# 头文件排序增强逻辑
+SortIncludes: true
+IncludeCategories:
+  - Regex: '^<cuda|^<nv'            # CUDA/NVIDIA 相关 (must match before std lib)
+    Priority: 2
+  - Regex: '^<[^/.]+(\.h)?>$'       # 标准库 (如 <vector>, <stdio.h>)
+    Priority: 1
+  - Regex: '^[<"](cutlass|cute|ATen|c10|torch)/' # 核心大库
+    Priority: 3
+  - Regex: '^"kerutils/'            # 内部公共库
+    Priority: 4
+  - Regex: '.*'                     # 其他/本地头文件
+    Priority: 5
+IncludeIsMainRegex: '([-_](test|unittest))?$'
+
+# 当参数换行时，不要对齐到左括号，而是换行并缩进
+AlignAfterOpenBracket: AlwaysBreak
+
+# 既然参数这么多，强制每个参数占用一行（关闭装箱）
+BinPackParameters: false
+BinPackArguments: false
+
+# 顶层函数定义的返回类型单独放一行
+AlwaysBreakAfterReturnType: All
+PenaltyReturnTypeOnItsOwnLine: 0
