@@ -65,6 +65,27 @@ kda_fwd_prefill(
     torch::Tensor workspace_buffer,
     float scale,
     bool safe_gate);
+
+void
+ChunkKDABwdIntraSm90(
+    at::Tensor q,
+    at::Tensor k,
+    at::Tensor g,
+    at::Tensor beta,
+    at::Tensor dAqk,
+    at::Tensor dAkk,
+    at::Tensor dq,
+    at::Tensor dk,
+    at::Tensor db,
+    at::Tensor dg,
+    at::Tensor cu_seqlens,
+    at::Tensor chunk_indices,
+    at::Tensor dq_out,
+    at::Tensor dk_out,
+    at::Tensor db_out,
+    at::Tensor dg_out,
+    at::Tensor tile_counter,
+    int chunk_size);
 #endif
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -75,5 +96,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 #endif
 #if defined(CULA_SM90A_ENABLED)
     m.def("kda_fwd_prefill", &kda_fwd_prefill);
+    m.def("chunk_kda_bwd_intra_sm90", &ChunkKDABwdIntraSm90);
 #endif
 }
