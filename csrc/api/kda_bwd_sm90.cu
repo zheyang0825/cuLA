@@ -25,7 +25,11 @@ ChunkKDABwdIntraSm90(
     at::Tensor db_out,         // [total_q_len, h] fp32 (output)
     at::Tensor dg_out,         // [total_q_len, h, d] fp32 (output)
     at::Tensor tile_counter,   // [1] int32
-    int chunk_size) {
+    int chunk_size,
+    std::optional<at::Tensor> debug_kg,   // [total_q_len, h, d] fp32
+    std::optional<at::Tensor> debug_qg,   // [total_q_len, h, d] fp32
+    std::optional<at::Tensor> debug_kbg)  // [total_q_len, h, d] fp32
+{
     TORCH_CHECK(q.is_cuda(), "q must be on CUDA");
     TORCH_CHECK(q.dtype() == torch::kBFloat16, "q must be bfloat16");
     TORCH_CHECK(k.dtype() == torch::kBFloat16, "k must be bfloat16");
@@ -88,6 +92,10 @@ ChunkKDABwdIntraSm90(
     params.dg_out_ptr = dg_out.data_ptr();
     params.cu_seqlens_ptr = cu_seqlens.data_ptr();
     params.chunk_indices_ptr = chunk_indices.data_ptr();
+
+    params.debug_kg_ptr = debug_kg.has_value() ? debug_kg->data_ptr() : nullptr;
+    params.debug_qg_ptr = debug_qg.has_value() ? debug_qg->data_ptr() : nullptr;
+    params.debug_kbg_ptr = debug_kbg.has_value() ? debug_kbg->data_ptr() : nullptr;
 
     params.tile_scheduler_params.num_blocks = num_chunks;
     params.tile_scheduler_params.num_heads = h;

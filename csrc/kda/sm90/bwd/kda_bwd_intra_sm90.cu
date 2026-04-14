@@ -211,7 +211,7 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
         for (int i = 0; i < NUM_BUF; ++i) {
             cute::initialize_barrier(smem->bar_qkg_ready[i], 1);
         }
-        cute::initialize_barrier(smem->bar_dA_ready, 1);
+        cute::initialize_barrier(smem->bar_dA_ready, 2);  // TMA (arrive_expect_tx) + warp1 explicit arrive
 
         // Async barriers: Prep → MMA (arrival count = 256 for Prep WGs)
         cute::initialize_barrier(smem->bar_mask_ready, 256);
@@ -380,8 +380,11 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
                             (i < sub_seq_len) ? beta_base[(token_offset + tile_idx * T_TILE + i) * params.h + head_idx]
                                               : 0.0f;
                     }
-                    __threadfence_block();
+                    fence_view_async_shared();
                 }
+
+                // Signal Prep: dA + beta ready (pairs with bar_dA_ready arrival count = 2)
+                cute::arrive_barrier(smem->bar_dA_ready);
             }  // end persistent tile loop
         }
 
@@ -542,6 +545,26 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
                 }
 
                 fence_view_async_shared();
+
+                // ── Debug output: write B operands to HBM (when enabled) ──
+                if (params.debug_kg_ptr || params.debug_qg_ptr || params.debug_kbg_ptr) {
+                    int stride_hd = params.h * K_SIZE;
+                    int base_offset =
+                        (token_offset + tile_idx * T_TILE) * params.h * K_SIZE + head_idx * K_SIZE + k_idx * K_TILE;
+                    for (int elem = prep_tid; elem < T_TILE * K_TILE; elem += 256) {
+                        int row = elem / K_TILE;
+                        int col = elem % K_TILE;
+                        if (row < sub_seq_len) {
+                            int out_idx = base_offset + row * stride_hd + col;
+                            if (params.debug_kg_ptr)
+                                ((float*)params.debug_kg_ptr)[out_idx] = smem->smem_kg[cur_buf][elem];
+                            if (params.debug_qg_ptr)
+                                ((float*)params.debug_qg_ptr)[out_idx] = smem->smem_qg[cur_buf][elem];
+                            if (params.debug_kbg_ptr)
+                                ((float*)params.debug_kbg_ptr)[out_idx] = smem->smem_kbg[cur_buf][elem];
+                        }
+                    }
+                }
 
                 // ── Signal MMA: B operands ready ──
                 cute::arrive_barrier(smem->bar_kg_ready[cur_buf]);

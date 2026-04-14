@@ -98,6 +98,11 @@ struct KDA_bwd_intra_params {
     void* __restrict__ cu_seqlens_ptr;     //[b + 1]
     void* __restrict__ chunk_indices_ptr;  //[len(cu_seqlens) - 1]
 
+    // Debug output (nullable — set to nullptr to disable)
+    void* __restrict__ debug_kg_ptr;   //[total_q_len, h, d] fp32
+    void* __restrict__ debug_qg_ptr;   //[total_q_len, h, d] fp32
+    void* __restrict__ debug_kbg_ptr;  //[total_q_len, h, d] fp32
+
     StaticPersistentTileScheduler::Params tile_scheduler_params;
 
     int num_sm;
