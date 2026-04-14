@@ -122,8 +122,7 @@ struct SharedStorage {
 
     // ── Pipeline barriers ──
     // TmaAsync pipelines: LdSt → Prep
-    alignas(16) cute::uint64_t bar_qkg_ready[NUM_BUF];   // Q, K, G loaded
-    alignas(16) cute::uint64_t bar_dqkg_ready[NUM_BUF];  // dQ, dK, dG inter loaded
+    alignas(16) cute::uint64_t bar_qkg_ready[NUM_BUF];   // Q, K, G + dQ, dK, dG inter loaded
     alignas(16) cute::uint64_t bar_dA_ready;             // dAqk, dAkk, beta loaded
 
     // Async pipelines: Prep → MMA
@@ -211,7 +210,6 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
         // TmaAsync barriers: LdSt → Prep (arrival count = 1 for TMA)
         for (int i = 0; i < NUM_BUF; ++i) {
             cute::initialize_barrier(smem->bar_qkg_ready[i], 1);
-            cute::initialize_barrier(smem->bar_dqkg_ready[i], 1);
         }
         cute::initialize_barrier(smem->bar_dA_ready, 1);
 
@@ -242,17 +240,18 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
     __syncthreads();
 
     // ── Phase tracking ──
-    int buf_idx = 0;       // double-buffer index for ki data
-    int phase_qkg = 0;     // barrier phase for qkg_pipeline
-    int phase_dqkg = 0;    // barrier phase for dqkg_pipeline
-    int phase_dA = 0;      // barrier phase for dA_pipeline
-    int phase_mask = 0;    // barrier phase for mask_pipeline
-    int phase_kg = 0;      // barrier phase for kg_pipeline
-    int phase_qg = 0;      // barrier phase for qg_pipeline
-    int phase_kbg = 0;     // barrier phase for kbg_pipeline
-    int phase_mma_ki = 0;  // barrier phase for mma_ki_pipeline
-    int phase_epi = 0;     // barrier phase for epilogue_pipeline
-    int phase_free = 0;    // barrier phase for buf_free
+    // Double-buffered barriers need per-buffer phase tracking because
+    // each buffer's barrier has an independent phase counter.
+    int buf_idx = 0;                     // double-buffer index for ki data
+    int phase_qkg[NUM_BUF] = {0, 0};     // barrier phase for qkg_pipeline (Q,K,G + dQ,dK,dG)
+    int phase_dA = 0;                    // barrier phase for dA_pipeline (single)
+    int phase_mask = 0;                  // barrier phase for mask_pipeline (single)
+    int phase_kg[NUM_BUF] = {0, 0};      // barrier phase for kg_pipeline
+    int phase_qg[NUM_BUF] = {0, 0};      // barrier phase for qg_pipeline
+    int phase_kbg[NUM_BUF] = {0, 0};     // barrier phase for kbg_pipeline
+    int phase_mma_ki[NUM_BUF] = {0, 0};  // barrier phase for mma_ki_pipeline
+    int phase_epi = 0;                   // barrier phase for epilogue_pipeline (single)
+    int phase_free[NUM_BUF] = {0, 0};    // barrier phase for buf_free
 
     // =================================================================
     // WG0: LdSt — TMA loads + writes
@@ -260,19 +259,98 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
     if (role == WGRole::LdSt) {
         cutlass::arch::warpgroup_reg_dealloc<REG_LDST>();
 
-        // ── Persistent tile loop (Load warp: warp0 elected thread) ──
+        // ── Warp0: TMA load Q, K, G + dQ, dK, dG per ki (double-buffered) ──
         if (warp_idx_in_wg == 0 && elect_one_sync()) {
             for (; tile_scheduler.is_valid(); tile_scheduler.advance()) {
                 int tid = tile_scheduler.get_current_tile_id();
 
-                // Decode tile coordinates
                 auto blk_coord = TileScheduler::decode_tile_coord(tid, params.h, chunk_indices_ptr, cu_len_ptr);
                 int batch_idx = get<0>(blk_coord);
                 int head_idx = get<1>(blk_coord);
                 int tile_idx = get<2>(blk_coord);
                 int token_offset = cu_len_ptr[batch_idx];
 
-                // ── Warp1 work: TMA load dAqk, dAkk (once per tile) ──
+                for (int k_idx = 0; k_idx < K_ITERATION; ++k_idx) {
+                    int cur_buf = k_idx % NUM_BUF;
+
+                    // Wait for buffer to be free (from previous tile's Prep epilogue)
+                    if (k_idx >= NUM_BUF) {
+                        cute::wait_barrier(smem->bar_buf_free[cur_buf], phase_free[cur_buf]);
+                        phase_free[cur_buf] ^= 1;
+                    }
+
+                    // TMA load Q, K, G + dQ, dK, dG inter-chunk (single barrier)
+                    {
+                        Tensor sQ = make_tensor(make_smem_ptr(smem->smem_q[cur_buf].data()), SmemLayoutInputBF16{});
+                        Tensor sK = make_tensor(make_smem_ptr(smem->smem_k[cur_buf].data()), SmemLayoutInputBF16{});
+                        Tensor sG = make_tensor(make_smem_ptr(smem->smem_g[cur_buf].data()), SmemLayoutInputFP32{});
+                        Tensor sDQ =
+                            make_tensor(make_smem_ptr(smem->smem_dq_in[cur_buf].data()), SmemLayoutInputFP32{});
+                        Tensor sDK =
+                            make_tensor(make_smem_ptr(smem->smem_dk_in[cur_buf].data()), SmemLayoutInputFP32{});
+                        Tensor sDG =
+                            make_tensor(make_smem_ptr(smem->smem_dg_in[cur_buf].data()), SmemLayoutInputFP32{});
+
+                        int tma_bytes = sizeof(make_tensor_like(sQ)) + sizeof(make_tensor_like(sK)) +
+                                        sizeof(make_tensor_like(sG)) + sizeof(make_tensor_like(sDQ)) +
+                                        sizeof(make_tensor_like(sDK)) + sizeof(make_tensor_like(sDG));
+
+                        Tensor mQ = domain_offset(
+                            make_coord(token_offset, _0{}, _0{}),
+                            tma_params.tma_q.get_tma_tensor(tma_params.shape_qkg));
+                        Tensor mK = domain_offset(
+                            make_coord(token_offset, _0{}, _0{}),
+                            tma_params.tma_k.get_tma_tensor(tma_params.shape_qkg));
+                        Tensor mG = domain_offset(
+                            make_coord(token_offset, _0{}, _0{}),
+                            tma_params.tma_g.get_tma_tensor(tma_params.shape_qkg));
+                        Tensor mDQ = domain_offset(
+                            make_coord(token_offset, _0{}, _0{}),
+                            tma_params.tma_dq.get_tma_tensor(tma_params.shape_qkg));
+                        Tensor mDK = domain_offset(
+                            make_coord(token_offset, _0{}, _0{}),
+                            tma_params.tma_dk.get_tma_tensor(tma_params.shape_qkg));
+                        Tensor mDG = domain_offset(
+                            make_coord(token_offset, _0{}, _0{}),
+                            tma_params.tma_dg.get_tma_tensor(tma_params.shape_qkg));
+
+                        Tensor gQ = local_tile(
+                            mQ(_, _, head_idx), make_shape(Int<T_TILE>{}, Int<K_TILE>{}), make_coord(tile_idx, k_idx));
+                        Tensor gK = local_tile(
+                            mK(_, _, head_idx), make_shape(Int<T_TILE>{}, Int<K_TILE>{}), make_coord(tile_idx, k_idx));
+                        Tensor gG = local_tile(
+                            mG(_, _, head_idx), make_shape(Int<T_TILE>{}, Int<K_TILE>{}), make_coord(tile_idx, k_idx));
+                        Tensor gDQ = local_tile(
+                            mDQ(_, _, head_idx), make_shape(Int<T_TILE>{}, Int<K_TILE>{}), make_coord(tile_idx, k_idx));
+                        Tensor gDK = local_tile(
+                            mDK(_, _, head_idx), make_shape(Int<T_TILE>{}, Int<K_TILE>{}), make_coord(tile_idx, k_idx));
+                        Tensor gDG = local_tile(
+                            mDG(_, _, head_idx), make_shape(Int<T_TILE>{}, Int<K_TILE>{}), make_coord(tile_idx, k_idx));
+
+                        cute::set_barrier_transaction_bytes(smem->bar_qkg_ready[cur_buf], tma_bytes);
+                        launch_tma_copy(tma_params.tma_q, gQ, sQ, smem->bar_qkg_ready[cur_buf]);
+                        launch_tma_copy(tma_params.tma_k, gK, sK, smem->bar_qkg_ready[cur_buf]);
+                        launch_tma_copy(tma_params.tma_g, gG, sG, smem->bar_qkg_ready[cur_buf]);
+                        launch_tma_copy(tma_params.tma_dq, gDQ, sDQ, smem->bar_qkg_ready[cur_buf]);
+                        launch_tma_copy(tma_params.tma_dk, gDK, sDK, smem->bar_qkg_ready[cur_buf]);
+                        launch_tma_copy(tma_params.tma_dg, gDG, sDG, smem->bar_qkg_ready[cur_buf]);
+                    }
+                }  // end per-ki TMA loads
+            }  // end persistent tile loop
+        }
+
+        // ── Warp1: TMA load dAqk, dAkk + beta (once per tile) ──
+        if (warp_idx_in_wg == 1 && elect_one_sync()) {
+            for (; tile_scheduler.is_valid(); tile_scheduler.advance()) {
+                int tid = tile_scheduler.get_current_tile_id();
+
+                auto blk_coord = TileScheduler::decode_tile_coord(tid, params.h, chunk_indices_ptr, cu_len_ptr);
+                int batch_idx = get<0>(blk_coord);
+                int head_idx = get<1>(blk_coord);
+                int tile_idx = get<2>(blk_coord);
+                int token_offset = cu_len_ptr[batch_idx];
+
+                // TMA load dAqk, dAkk
                 {
                     Tensor sDAqk = make_tensor(make_smem_ptr(smem->smem_daqk.data()), SmemLayoutDA{});
                     Tensor sDAkk = make_tensor(make_smem_ptr(smem->smem_dakk.data()), SmemLayoutDA{});
@@ -292,11 +370,10 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
                     launch_tma_copy(tma_params.tma_dAkk, gDakk, sDAkk, smem->bar_dA_ready);
                 }
 
-                // ── Load beta (scalar, via elected thread direct global load) ──
+                // Load beta (scalar, via elected thread direct global load)
                 {
                     int seq_len = cu_len_ptr[batch_idx + 1] - cu_len_ptr[batch_idx];
                     int sub_seq_len = min(T_TILE, seq_len - tile_idx * T_TILE);
-                    // Load beta for this tile into smem
                     float* beta_base = (float*)params.beta_ptr;
                     for (int i = 0; i < T_TILE; ++i) {
                         smem->beta_smem[i] =
@@ -305,90 +382,11 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
                     }
                     __threadfence_block();
                 }
-
-                // ── Warp0 work: TMA load Q, K, G + dQ, dK, dG per ki (double-buffered) ──
-                for (int k_idx = 0; k_idx < K_ITERATION; ++k_idx) {
-                    int cur_buf = k_idx % NUM_BUF;
-
-                    // Wait for buffer to be free (from previous tile's Prep epilogue)
-                    if (k_idx >= NUM_BUF) {
-                        cute::wait_barrier(smem->bar_buf_free[cur_buf], phase_free);
-                        phase_free ^= 1;
-                    }
-
-                    // TMA load Q, K, G
-                    {
-                        Tensor sQ = make_tensor(make_smem_ptr(smem->smem_q[cur_buf].data()), SmemLayoutInputBF16{});
-                        Tensor sK = make_tensor(make_smem_ptr(smem->smem_k[cur_buf].data()), SmemLayoutInputBF16{});
-                        Tensor sG = make_tensor(make_smem_ptr(smem->smem_g[cur_buf].data()), SmemLayoutInputFP32{});
-
-                        int tma_bytes_qkg =
-                            sizeof(make_tensor_like(sQ)) + sizeof(make_tensor_like(sK)) + sizeof(make_tensor_like(sG));
-
-                        Tensor mQ = domain_offset(
-                            make_coord(token_offset, _0{}, _0{}),
-                            tma_params.tma_q.get_tma_tensor(tma_params.shape_qkg));
-                        Tensor mK = domain_offset(
-                            make_coord(token_offset, _0{}, _0{}),
-                            tma_params.tma_k.get_tma_tensor(tma_params.shape_qkg));
-                        Tensor mG = domain_offset(
-                            make_coord(token_offset, _0{}, _0{}),
-                            tma_params.tma_g.get_tma_tensor(tma_params.shape_qkg));
-
-                        Tensor gQ = local_tile(
-                            mQ(_, _, head_idx), make_shape(Int<T_TILE>{}, Int<K_TILE>{}), make_coord(tile_idx, k_idx));
-                        Tensor gK = local_tile(
-                            mK(_, _, head_idx), make_shape(Int<T_TILE>{}, Int<K_TILE>{}), make_coord(tile_idx, k_idx));
-                        Tensor gG = local_tile(
-                            mG(_, _, head_idx), make_shape(Int<T_TILE>{}, Int<K_TILE>{}), make_coord(tile_idx, k_idx));
-
-                        cute::set_barrier_transaction_bytes(smem->bar_qkg_ready[cur_buf], tma_bytes_qkg);
-                        launch_tma_copy(tma_params.tma_q, gQ, sQ, smem->bar_qkg_ready[cur_buf]);
-                        launch_tma_copy(tma_params.tma_k, gK, sK, smem->bar_qkg_ready[cur_buf]);
-                        launch_tma_copy(tma_params.tma_g, gG, sG, smem->bar_qkg_ready[cur_buf]);
-                    }
-
-                    // TMA load dQ, dK, dG inter-chunk
-                    {
-                        Tensor sDQ =
-                            make_tensor(make_smem_ptr(smem->smem_dq_in[cur_buf].data()), SmemLayoutInputFP32{});
-                        Tensor sDK =
-                            make_tensor(make_smem_ptr(smem->smem_dk_in[cur_buf].data()), SmemLayoutInputFP32{});
-                        Tensor sDG =
-                            make_tensor(make_smem_ptr(smem->smem_dg_in[cur_buf].data()), SmemLayoutInputFP32{});
-
-                        int tma_bytes_dqkg = sizeof(make_tensor_like(sDQ)) + sizeof(make_tensor_like(sDK)) +
-                                             sizeof(make_tensor_like(sDG));
-
-                        Tensor mDQ = domain_offset(
-                            make_coord(token_offset, _0{}, _0{}),
-                            tma_params.tma_dq.get_tma_tensor(tma_params.shape_qkg));
-                        Tensor mDK = domain_offset(
-                            make_coord(token_offset, _0{}, _0{}),
-                            tma_params.tma_dk.get_tma_tensor(tma_params.shape_qkg));
-                        Tensor mDG = domain_offset(
-                            make_coord(token_offset, _0{}, _0{}),
-                            tma_params.tma_dg.get_tma_tensor(tma_params.shape_qkg));
-
-                        Tensor gDQ = local_tile(
-                            mDQ(_, _, head_idx), make_shape(Int<T_TILE>{}, Int<K_TILE>{}), make_coord(tile_idx, k_idx));
-                        Tensor gDK = local_tile(
-                            mDK(_, _, head_idx), make_shape(Int<T_TILE>{}, Int<K_TILE>{}), make_coord(tile_idx, k_idx));
-                        Tensor gDG = local_tile(
-                            mDG(_, _, head_idx), make_shape(Int<T_TILE>{}, Int<K_TILE>{}), make_coord(tile_idx, k_idx));
-
-                        cute::set_barrier_transaction_bytes(smem->bar_dqkg_ready[cur_buf], tma_bytes_dqkg);
-                        launch_tma_copy(tma_params.tma_dq, gDQ, sDQ, smem->bar_dqkg_ready[cur_buf]);
-                        launch_tma_copy(tma_params.tma_dk, gDK, sDK, smem->bar_dqkg_ready[cur_buf]);
-                        launch_tma_copy(tma_params.tma_dg, gDG, sDG, smem->bar_dqkg_ready[cur_buf]);
-                    }
-                }  // end per-ki TMA loads
-
-                phase_dA ^= 1;
             }  // end persistent tile loop
         }
-        // Other warps in LdSt WG (warp1, warp2, warp3) idle in Phase 1
-        // Warp3 will handle TMA store dB in Phase 4
+
+        // Warp2: idle
+        // Warp3: Phase 4 TMA store dB
 
         // =================================================================
         // WG1: MMA — mma.sync 4-pass sub-chunk loop (Phase 1: placeholder)
@@ -414,13 +412,13 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
                 int cur_buf = k_idx % NUM_BUF;
 
                 // Wait for KG ready
-                cute::wait_barrier(smem->bar_kg_ready[cur_buf], phase_kg);
+                cute::wait_barrier(smem->bar_kg_ready[cur_buf], phase_kg[cur_buf]);
 
                 // Wait for QG ready
-                cute::wait_barrier(smem->bar_qg_ready[cur_buf], phase_qg);
+                cute::wait_barrier(smem->bar_qg_ready[cur_buf], phase_qg[cur_buf]);
 
                 // Wait for KBG ready
-                cute::wait_barrier(smem->bar_kbg_ready[cur_buf], phase_kbg);
+                cute::wait_barrier(smem->bar_kbg_ready[cur_buf], phase_kbg[cur_buf]);
 
                 // Phase 1 placeholder: just write zeros to dQ/dK output buffers
                 // TODO(Phase 3): Implement 4-pass mma.sync sub-chunk loop
@@ -433,13 +431,12 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
                 // Signal Prep: dQ+dK for this ki ready
                 cute::arrive_barrier(smem->bar_mma_ki_ready[cur_buf]);
 
-                phase_kg ^= 1;
-                phase_qg ^= 1;
-                phase_kbg ^= 1;
+                phase_kg[cur_buf] ^= 1;
+                phase_qg[cur_buf] ^= 1;
+                phase_kbg[cur_buf] ^= 1;
             }
 
             phase_mask ^= 1;
-            phase_mma_ki ^= 1;
         }
 
         // =================================================================
@@ -480,7 +477,7 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
                 int cur_buf = k_idx % NUM_BUF;
 
                 // Wait for Q, K, G data
-                cute::wait_barrier(smem->bar_qkg_ready[cur_buf], phase_qkg);
+                cute::wait_barrier(smem->bar_qkg_ready[cur_buf], phase_qkg[cur_buf]);
 
                 // ── Construct KG: KG[j,d] = K[j,d] * exp2f(G_norm[d] - G[j,d]) ──
                 // Per-subchunk G_norm: 4 sub-tiles, each 16 rows
@@ -552,11 +549,10 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
                 cute::arrive_barrier(smem->bar_kbg_ready[cur_buf]);
 
                 // ── Wait for MMA output ──
-                cute::wait_barrier(smem->bar_mma_ki_ready[cur_buf], phase_mma_ki);
+                cute::wait_barrier(smem->bar_mma_ki_ready[cur_buf], phase_mma_ki[cur_buf]);
 
                 // ── Epilogue per ki (Phase 1: placeholder — just pass through) ──
-                // Wait for dQ, dK, dG inter-chunk data
-                cute::wait_barrier(smem->bar_dqkg_ready[cur_buf], phase_dqkg);
+                // Q, K, G + dQ, dK, dG inter already available (waited bar_qkg_ready above)
 
                 // TODO(Phase 4): Full epilogue implementation
                 // For now: write dQ_inter, dK_inter, dG_inter directly to output (pass-through)
@@ -598,9 +594,8 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
                 // Signal buffer free for next ki TMA load
                 cute::arrive_barrier(smem->bar_buf_free[cur_buf]);
 
-                phase_qkg ^= 1;
-                phase_dqkg ^= 1;
-                phase_mma_ki ^= 1;
+                phase_qkg[cur_buf] ^= 1;
+                phase_mma_ki[cur_buf] ^= 1;
             }  // end per-ki loop
 
             // ── dB output (Phase 1: write zeros) ──
