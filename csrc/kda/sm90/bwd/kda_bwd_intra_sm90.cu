@@ -34,6 +34,12 @@ constexpr int NUM_THREADS = 512;              // 4 WG × 128
 constexpr int NUM_WG = 4;
 constexpr int CHUNK_SIZE = 64;
 
+// Clamped exp2f to prevent inf/NaN from large gate differences across sub-tiles
+__device__ __forceinline__ float
+safe_exp2f(float x) {
+    return exp2f(fminf(fmaxf(x, -126.0f), 126.0f));
+}
+
 // Register allocation
 constexpr int REG_LDST = 24;   // LdSt: minimal registers
 constexpr int REG_MMA = 168;   // MMA: fragment-heavy
@@ -94,7 +100,7 @@ using SmemLayoutDA = Layout<Shape<Int<T_TILE>, Int<T_TILE>>, Stride<Int<T_TILE>,
 using SmemLayoutB = Layout<Shape<Int<T_TILE>, Int<K_TILE>>, Stride<Int<K_TILE>, _1>>;
 
 // Beta: fp32 [64]
-using SmemLayoutBeta = Layout<Shape<Int<T_TILE>>, Stride<_1>>;
+// Beta is loaded via st.global (not TMA)
 
 // dB: fp32 [64]
 using SmemLayoutDB = Layout<Shape<Int<T_TILE>>, Stride<_1>>;
@@ -124,7 +130,10 @@ struct SharedStorage {
 
     // MMA output (double-buffered per ki)
     alignas(128) cute::array_aligned<float, T_TILE * K_TILE> smem_dq_out[NUM_BUF];  // 2 × 8 KB = 16 KB
-    alignas(128) cute::array_aligned<float, T_TILE * K_TILE> smem_dk_out[NUM_BUF];  // 2 × 8 KB = 16 KB
+    alignas(128)
+        cute::array_aligned<float, T_TILE * K_TILE> smem_dk_out[NUM_BUF];  // 2 × 8 KB = 16 KB (dK_lower from Pass 2)
+    alignas(128) cute::array_aligned<float, T_TILE * K_TILE> smem_dk_upper_out[NUM_BUF];  // 2 × 8 KB = 16 KB (dK_upper
+                                                                                          // from Pass 3+4)
 
     // Scalar data
     alignas(16) float beta_smem[T_TILE];  // 256 B
@@ -163,8 +172,7 @@ template <
     typename TMA_DAkk,
     typename TMA_DQ,
     typename TMA_DK,
-    typename TMA_DG,
-    typename TMA_BETA>
+    typename TMA_DG>
 struct TmaParams {
     ShapeQKG shape_qkg;
     ShapeDA shape_da;
@@ -176,7 +184,6 @@ struct TmaParams {
     TMA_DQ tma_dq;
     TMA_DK tma_dk;
     TMA_DG tma_dg;
-    TMA_BETA tma_beta;
 };
 
 using TileScheduler = StaticPersistentTileScheduler;
@@ -214,7 +221,6 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
         cute::prefetch_tma_descriptor(tma_params.tma_dq.get_tma_descriptor());
         cute::prefetch_tma_descriptor(tma_params.tma_dk.get_tma_descriptor());
         cute::prefetch_tma_descriptor(tma_params.tma_dg.get_tma_descriptor());
-        cute::prefetch_tma_descriptor(tma_params.tma_beta.get_tma_descriptor());
 
         // TmaAsync barriers: LdSt → Prep (arrival count = 1 for TMA)
         for (int i = 0; i < NUM_BUF; ++i) {
@@ -268,6 +274,7 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
 
         // ── Warp0: TMA load Q, K, G + dQ, dK, dG per ki (double-buffered) ──
         if (warp_idx_in_wg == 0 && elect_one_sync()) {
+            bool first_tile = true;
             for (; tile_scheduler.is_valid(); tile_scheduler.advance()) {
                 int tid = tile_scheduler.get_current_tile_id();
 
@@ -280,8 +287,10 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
                 for (int k_idx = 0; k_idx < K_ITERATION; ++k_idx) {
                     int cur_buf = k_idx % NUM_BUF;
 
-                    // Wait for buffer to be free (from previous tile's Prep epilogue)
-                    if (k_idx >= NUM_BUF) {
+                    // Wait for buffer to be free (from Prep epilogue).
+                    // First tile: buffers start free, so skip wait for ki < NUM_BUF.
+                    // Subsequent tiles: always wait (previous tile's last ki may still be in use).
+                    if (k_idx >= NUM_BUF || !first_tile) {
                         cute::wait_barrier(smem->bar_buf_free[cur_buf], phase_free[cur_buf]);
                         phase_free[cur_buf] ^= 1;
                     }
@@ -343,11 +352,13 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
                         launch_tma_copy(tma_params.tma_dg, gDG, sDG, smem->bar_qkg_ready[cur_buf]);
                     }
                 }  // end per-ki TMA loads
+                first_tile = false;
             }  // end persistent tile loop
         }
 
         // ── Warp1: TMA load dAqk, dAkk + beta (once per tile) ──
         if (warp_idx_in_wg == 1 && elect_one_sync()) {
+            bool first_tile_w1 = true;
             for (; tile_scheduler.is_valid(); tile_scheduler.advance()) {
                 int tid = tile_scheduler.get_current_tile_id();
 
@@ -356,6 +367,13 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
                 int head_idx = get<1>(blk_coord);
                 int tile_idx = get<2>(blk_coord);
                 int token_offset = cu_len_ptr[batch_idx];
+
+                // Wait for previous tile's epilogue to finish before overwriting dA/beta
+                // (smem_daqk, smem_dakk, beta_smem are single-buffered)
+                if (!first_tile_w1) {
+                    cute::wait_barrier(smem->bar_epilogue_done, phase_epi);
+                    phase_epi ^= 1;
+                }
 
                 // TMA load dAqk, dAkk
                 {
@@ -392,6 +410,8 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
 
                 // Signal Prep: dA + beta ready (pairs with bar_dA_ready arrival count = 2)
                 cute::arrive_barrier(smem->bar_dA_ready);
+
+                first_tile_w1 = false;
             }  // end persistent tile loop
         }
 
@@ -506,10 +526,10 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
                         float gn0 = g_smem[(js * 16) * K_TILE + c_col0];
                         float gn1 = g_smem[(js * 16) * K_TILE + c_col1];
 
-                        c0 += t0 * exp2f(g_smem[c_row0 * K_TILE + c_col0] - gn0);
-                        c1 += t1 * exp2f(g_smem[c_row0 * K_TILE + c_col1] - gn1);
-                        c2 += t2 * exp2f(g_smem[c_row1 * K_TILE + c_col0] - gn0);
-                        c3 += t3 * exp2f(g_smem[c_row1 * K_TILE + c_col1] - gn1);
+                        c0 += t0 * safe_exp2f(g_smem[c_row0 * K_TILE + c_col0] - gn0);
+                        c1 += t1 * safe_exp2f(g_smem[c_row0 * K_TILE + c_col1] - gn1);
+                        c2 += t2 * safe_exp2f(g_smem[c_row1 * K_TILE + c_col0] - gn0);
+                        c3 += t3 * safe_exp2f(g_smem[c_row1 * K_TILE + c_col1] - gn1);
                     }
 
                     // R2S: write dQ fragment to smem_dq_out
@@ -566,10 +586,10 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
                         float gn0 = g_smem[(js * 16) * K_TILE + c_col0];
                         float gn1 = g_smem[(js * 16) * K_TILE + c_col1];
 
-                        c0 += t0 * exp2f(g_smem[cr0 * K_TILE + c_col0] - gn0);
-                        c1 += t1 * exp2f(g_smem[cr0 * K_TILE + c_col1] - gn1);
-                        c2 += t2 * exp2f(g_smem[cr1 * K_TILE + c_col0] - gn0);
-                        c3 += t3 * exp2f(g_smem[cr1 * K_TILE + c_col1] - gn1);
+                        c0 += t0 * safe_exp2f(g_smem[cr0 * K_TILE + c_col0] - gn0);
+                        c1 += t1 * safe_exp2f(g_smem[cr0 * K_TILE + c_col1] - gn1);
+                        c2 += t2 * safe_exp2f(g_smem[cr1 * K_TILE + c_col0] - gn0);
+                        c3 += t3 * safe_exp2f(g_smem[cr1 * K_TILE + c_col1] - gn1);
                     }
 
                     dk_reg[is * 4 + 0] = c0;
@@ -629,16 +649,16 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
                                 t0, t1, t2, t3, f2u(a0), f2u(a1), f2u(a2), f2u(a3), f2u(b0), f2u(b1), t0, t1, t2, t3);
                         }
 
-                        // K-side scaling: exp2f(clamp(G_norm_is - G[j], -126, 126))
+                        // K-side scaling: exp2f(G_norm_is - G[j])
                         int cr0 = js * 16 + group_id;
                         int cr1 = cr0 + 8;
                         float gn0 = g_smem[(is * 16) * K_TILE + c_col0];
                         float gn1 = g_smem[(is * 16) * K_TILE + c_col1];
 
-                        t0 *= exp2f(fminf(fmaxf(gn0 - g_smem[cr0 * K_TILE + c_col0], -126.0f), 126.0f));
-                        t1 *= exp2f(fminf(fmaxf(gn1 - g_smem[cr0 * K_TILE + c_col1], -126.0f), 126.0f));
-                        t2 *= exp2f(fminf(fmaxf(gn0 - g_smem[cr1 * K_TILE + c_col0], -126.0f), 126.0f));
-                        t3 *= exp2f(fminf(fmaxf(gn1 - g_smem[cr1 * K_TILE + c_col1], -126.0f), 126.0f));
+                        t0 *= safe_exp2f(gn0 - g_smem[cr0 * K_TILE + c_col0]);
+                        t1 *= safe_exp2f(gn1 - g_smem[cr0 * K_TILE + c_col1]);
+                        t2 *= safe_exp2f(gn0 - g_smem[cr1 * K_TILE + c_col0]);
+                        t3 *= safe_exp2f(gn1 - g_smem[cr1 * K_TILE + c_col1]);
 
                         c0 += t0;
                         c1 += t1;
@@ -686,10 +706,10 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
                         float gn0 = g_smem[(is * 16) * K_TILE + c_col0];
                         float gn1 = g_smem[(is * 16) * K_TILE + c_col1];
 
-                        t0 *= exp2f(fminf(fmaxf(gn0 - g_smem[cr0 * K_TILE + c_col0], -126.0f), 126.0f));
-                        t1 *= exp2f(fminf(fmaxf(gn1 - g_smem[cr0 * K_TILE + c_col1], -126.0f), 126.0f));
-                        t2 *= exp2f(fminf(fmaxf(gn0 - g_smem[cr1 * K_TILE + c_col0], -126.0f), 126.0f));
-                        t3 *= exp2f(fminf(fmaxf(gn1 - g_smem[cr1 * K_TILE + c_col1], -126.0f), 126.0f));
+                        t0 *= safe_exp2f(gn0 - g_smem[cr0 * K_TILE + c_col0]);
+                        t1 *= safe_exp2f(gn1 - g_smem[cr0 * K_TILE + c_col1]);
+                        t2 *= safe_exp2f(gn0 - g_smem[cr1 * K_TILE + c_col0]);
+                        t3 *= safe_exp2f(gn1 - g_smem[cr1 * K_TILE + c_col1]);
 
                         c0 += t0;
                         c1 += t1;
@@ -703,15 +723,21 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
                     dkt_reg[js * 4 + 3] = c3;
                 }
 
-                // ── R2S: Combine dK_lower + dK_upper → smem_dk_out ──
+                // ── R2S: dk_lower → smem_dk_out, dk_upper → smem_dk_upper_out ──
                 {
                     for (int s = 0; s < 4; ++s) {
                         int r0 = s * 16 + group_id;
                         int r1 = r0 + 8;
-                        smem->smem_dk_out[cur_buf][r0 * K_TILE + c_col0] = dk_reg[s * 4 + 0] + dkt_reg[s * 4 + 0];
-                        smem->smem_dk_out[cur_buf][r0 * K_TILE + c_col1] = dk_reg[s * 4 + 1] + dkt_reg[s * 4 + 1];
-                        smem->smem_dk_out[cur_buf][r1 * K_TILE + c_col0] = dk_reg[s * 4 + 2] + dkt_reg[s * 4 + 2];
-                        smem->smem_dk_out[cur_buf][r1 * K_TILE + c_col1] = dk_reg[s * 4 + 3] + dkt_reg[s * 4 + 3];
+                        // dK_lower (Pass 2)
+                        smem->smem_dk_out[cur_buf][r0 * K_TILE + c_col0] = dk_reg[s * 4 + 0];
+                        smem->smem_dk_out[cur_buf][r0 * K_TILE + c_col1] = dk_reg[s * 4 + 1];
+                        smem->smem_dk_out[cur_buf][r1 * K_TILE + c_col0] = dk_reg[s * 4 + 2];
+                        smem->smem_dk_out[cur_buf][r1 * K_TILE + c_col1] = dk_reg[s * 4 + 3];
+                        // dK_upper (Pass 3+4)
+                        smem->smem_dk_upper_out[cur_buf][r0 * K_TILE + c_col0] = dkt_reg[s * 4 + 0];
+                        smem->smem_dk_upper_out[cur_buf][r0 * K_TILE + c_col1] = dkt_reg[s * 4 + 1];
+                        smem->smem_dk_upper_out[cur_buf][r1 * K_TILE + c_col0] = dkt_reg[s * 4 + 2];
+                        smem->smem_dk_upper_out[cur_buf][r1 * K_TILE + c_col1] = dkt_reg[s * 4 + 3];
                     }
                 }
 
@@ -764,8 +790,19 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
                 // Wait for Q, K, G data
                 cute::wait_barrier(smem->bar_qkg_ready[cur_buf], phase_qkg[cur_buf]);
 
+                // Zero G at padding rows to prevent NaN in exp2f gate scaling
+                // (both B operand construction and MMA gate scaling read G from SMEM)
+                if (sub_seq_len < T_TILE) {
+                    float* g_ptr = smem->smem_g[cur_buf].data();
+                    for (int elem = prep_tid; elem < (T_TILE - sub_seq_len) * K_TILE; elem += 256) {
+                        g_ptr[(sub_seq_len + elem / K_TILE) * K_TILE + elem % K_TILE] = 0.0f;
+                    }
+                    fence_view_async_shared();
+                }
+
                 // ── Construct KG: KG[j,d] = K[j,d] * exp2f(G_norm[d] - G[j,d]) ──
                 // Per-subchunk G_norm: 4 sub-tiles, each 16 rows
+                // Zero padding rows (j >= sub_seq_len) to avoid NaN from cross-sequence gate values
                 {
                     float* kg_ptr = smem->smem_kg[cur_buf].data();
                     float* g_ptr = smem->smem_g[cur_buf].data();
@@ -774,14 +811,19 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
                     for (int elem = prep_tid; elem < T_TILE * K_TILE; elem += 256) {
                         int j = elem / K_TILE;
                         int d = elem % K_TILE;
-                        int js = j / SUB_T_TILE;           // sub-tile index
-                        int g_norm_row = js * SUB_T_TILE;  // G_norm = G[js*16, d]
 
-                        float g_val = g_ptr[j * K_TILE + d];
-                        float g_norm = g_ptr[g_norm_row * K_TILE + d];
-                        float k_val = static_cast<float>(k_ptr[j * K_TILE + d]);
+                        if (j < sub_seq_len) {
+                            int js = j / SUB_T_TILE;           // sub-tile index
+                            int g_norm_row = js * SUB_T_TILE;  // G_norm = G[js*16, d]
 
-                        kg_ptr[j * K_TILE + d] = k_val * exp2f(g_norm - g_val);
+                            float g_val = g_ptr[j * K_TILE + d];
+                            float g_norm = g_ptr[g_norm_row * K_TILE + d];
+                            float k_val = static_cast<float>(k_ptr[j * K_TILE + d]);
+
+                            kg_ptr[j * K_TILE + d] = k_val * safe_exp2f(g_norm - g_val);
+                        } else {
+                            kg_ptr[j * K_TILE + d] = 0.0f;
+                        }
                     }
                 }
 
@@ -794,14 +836,19 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
                     for (int elem = prep_tid; elem < T_TILE * K_TILE; elem += 256) {
                         int i = elem / K_TILE;
                         int d = elem % K_TILE;
-                        int is = i / SUB_T_TILE;
-                        int g_norm_row = is * SUB_T_TILE;
 
-                        float g_val = g_ptr[i * K_TILE + d];
-                        float g_norm = g_ptr[g_norm_row * K_TILE + d];
-                        float q_val = static_cast<float>(q_ptr[i * K_TILE + d]);
+                        if (i < sub_seq_len) {
+                            int is = i / SUB_T_TILE;
+                            int g_norm_row = is * SUB_T_TILE;
 
-                        qg_ptr[i * K_TILE + d] = q_val * exp2f(g_val - g_norm);
+                            float g_val = g_ptr[i * K_TILE + d];
+                            float g_norm = g_ptr[g_norm_row * K_TILE + d];
+                            float q_val = static_cast<float>(q_ptr[i * K_TILE + d]);
+
+                            qg_ptr[i * K_TILE + d] = q_val * safe_exp2f(g_val - g_norm);
+                        } else {
+                            qg_ptr[i * K_TILE + d] = 0.0f;
+                        }
                     }
                 }
 
@@ -814,15 +861,20 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
                     for (int elem = prep_tid; elem < T_TILE * K_TILE; elem += 256) {
                         int i = elem / K_TILE;
                         int d = elem % K_TILE;
-                        int is = i / SUB_T_TILE;
-                        int g_norm_row = is * SUB_T_TILE;
 
-                        float g_val = g_ptr[i * K_TILE + d];
-                        float g_norm = g_ptr[g_norm_row * K_TILE + d];
-                        float k_val = static_cast<float>(k_ptr[i * K_TILE + d]);
-                        float beta_val = smem->beta_smem[i];
+                        if (i < sub_seq_len) {
+                            int is = i / SUB_T_TILE;
+                            int g_norm_row = is * SUB_T_TILE;
 
-                        kbg_ptr[i * K_TILE + d] = k_val * beta_val * exp2f(g_val - g_norm);
+                            float g_val = g_ptr[i * K_TILE + d];
+                            float g_norm = g_ptr[g_norm_row * K_TILE + d];
+                            float k_val = static_cast<float>(k_ptr[i * K_TILE + d]);
+                            float beta_val = smem->beta_smem[i];
+
+                            kbg_ptr[i * K_TILE + d] = k_val * beta_val * safe_exp2f(g_val - g_norm);
+                        } else {
+                            kbg_ptr[i * K_TILE + d] = 0.0f;
+                        }
                     }
                 }
 
@@ -856,11 +908,7 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
                 // ── Wait for MMA output ──
                 cute::wait_barrier(smem->bar_mma_ki_ready[cur_buf], phase_mma_ki[cur_buf]);
 
-                // ── Epilogue per ki (Phase 1: placeholder — just pass through) ──
-                // Q, K, G + dQ, dK, dG inter already available (waited bar_qkg_ready above)
-
-                // TODO(Phase 4): Full epilogue implementation
-                // For now: write dQ_inter, dK_inter, dG_inter directly to output (pass-through)
+                // ── Epilogue per ki: dB accumulation, beta scaling, dQ/dK/dG output ──
                 {
                     float* dq_out_base = (float*)params.dq_out_ptr +
                                          (token_offset + tile_idx * T_TILE) * params.h * K_SIZE + head_idx * K_SIZE +
@@ -874,24 +922,42 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
 
                     int stride_hd = params.h * K_SIZE;
 
-                    // Each Prep thread handles a subset of elements
                     for (int elem = prep_tid; elem < T_TILE * K_TILE; elem += 256) {
                         int row = elem / K_TILE;
                         int col = elem % K_TILE;
                         if (row < sub_seq_len) {
-                            // Phase 1: output = inter (MMA output is zeros placeholder)
+                            // Read MMA outputs (separate dk_lower and dk_upper)
                             float dq_intra = smem->smem_dq_out[cur_buf][row * K_TILE + col];
-                            float dk_intra = smem->smem_dk_out[cur_buf][row * K_TILE + col];
+                            float dk_lower = smem->smem_dk_out[cur_buf][row * K_TILE + col];
+                            float dk_upper = smem->smem_dk_upper_out[cur_buf][row * K_TILE + col];
+
+                            // Read inter-chunk inputs
                             float dq_inter = smem->smem_dq_in[cur_buf][row * K_TILE + col];
                             float dk_inter = smem->smem_dk_in[cur_buf][row * K_TILE + col];
                             float dg_inter = smem->smem_dg_in[cur_buf][row * K_TILE + col];
 
+                            // Read Q, K for dB/dG computation
+                            float q_val = static_cast<float>(
+                                reinterpret_cast<bf16*>(smem->smem_q[cur_buf].data())[row * K_TILE + col]);
+                            float k_val = static_cast<float>(
+                                reinterpret_cast<bf16*>(smem->smem_k[cur_buf].data())[row * K_TILE + col]);
+                            float beta_i = smem->beta_smem[row];
+
+                            // dB: accumulate dk_lower * K BEFORE beta scaling
+                            atomicAdd(&smem->db_accum[row], dk_lower * k_val);
+
+                            // Beta scaling on dK_lower
+                            float dk_lower_beta = dk_lower * beta_i;
+
                             // dQ_final = dQ_inter + dQ_intra
                             dq_out_base[row * stride_hd + col] = dq_inter + dq_intra;
-                            // dK_final = dK_inter + dK_intra (simplified in Phase 1)
-                            dk_out_base[row * stride_hd + col] = dk_inter + dk_intra;
-                            // dG_final = dG_inter (Phase 1 placeholder)
-                            dg_out_base[row * stride_hd + col] = dg_inter;
+
+                            // dK_final = dK_inter + dK_lower*beta + dK_upper
+                            dk_out_base[row * stride_hd + col] = dk_inter + dk_lower_beta + dk_upper;
+
+                            // dG = dG_inter + Q*dQ_intra + (dK_lower*beta - dK_upper)*K
+                            dg_out_base[row * stride_hd + col] =
+                                dg_inter + q_val * dq_intra + (dk_lower_beta - dk_upper) * k_val;
                         }
                     }
                 }
@@ -903,12 +969,12 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
                 phase_mma_ki[cur_buf] ^= 1;
             }  // end per-ki loop
 
-            // ── dB output (Phase 1: write zeros) ──
-            // TODO(Phase 4): accumulate dB across ki, then store
+            // ── dB output: db_accum (cross-ki sum) + db_inter ──
             if (prep_tid < T_TILE && prep_tid < sub_seq_len) {
-                float* db_out =
-                    (float*)params.db_out_ptr + (token_offset + tile_idx * T_TILE + prep_tid) * params.h + head_idx;
-                *db_out = smem->db_accum[prep_tid];
+                int global_row = token_offset + tile_idx * T_TILE + prep_tid;
+                float db_inter = ((float*)params.db_ptr)[global_row * params.h + head_idx];
+                float* db_out = (float*)params.db_out_ptr + global_row * params.h + head_idx;
+                *db_out = smem->db_accum[prep_tid] + db_inter;
             }
 
             phase_dA ^= 1;
@@ -977,14 +1043,6 @@ run_kda_bwd_intra_sm90(KDA_bwd_intra_params& params, cudaStream_t stream) {
         make_tensor(make_gmem_ptr((float*)params.dg_ptr), make_layout(shape_QKG, stride_QKG)),
         SmemLayoutInputFP32{});
 
-    // Beta TMA: shape [total_q_len, H], stride [H, 1]
-    auto shape_Beta = make_shape(total_q_len, H);
-    auto stride_Beta = make_stride(H, _1{});
-    auto tma_Beta = cute::make_tma_copy(
-        SM90_TMA_LOAD{},
-        make_tensor(make_gmem_ptr((float*)params.beta_ptr), make_layout(shape_Beta, stride_Beta)),
-        SmemLayoutBeta{});
-
     auto tma_params_val = TmaParams<
         decltype(shape_QKG),
         decltype(shape_DA),
@@ -995,8 +1053,7 @@ run_kda_bwd_intra_sm90(KDA_bwd_intra_params& params, cudaStream_t stream) {
         decltype(tma_DAkk),
         decltype(tma_DQ),
         decltype(tma_DK),
-        decltype(tma_DG),
-        decltype(tma_Beta)>{
+        decltype(tma_DG)>{
         shape_QKG,
         shape_DA,
         tma_Q,
@@ -1007,7 +1064,6 @@ run_kda_bwd_intra_sm90(KDA_bwd_intra_params& params, cudaStream_t stream) {
         tma_DQ,
         tma_DK,
         tma_DG,
-        tma_Beta,
     };
 
     auto kda_kernel = &kda_bwd_intra_sm90_kernel<decltype(tma_params_val)>;
