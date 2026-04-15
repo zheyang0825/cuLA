@@ -5,6 +5,7 @@
 // B operands: fp32 row-major (hardware truncation to TF32)
 // Causal mask: on-the-fly in registers during A operand loading
 
+#include <cute/arch/mma_sm80.hpp>
 #include <cute/tensor.hpp>
 #include <cutlass/arch/barrier.h>
 #include <cutlass/arch/reg_reconfig.h>
@@ -37,6 +38,15 @@ constexpr int CHUNK_SIZE = 64;
 constexpr int REG_LDST = 24;   // LdSt: minimal registers
 constexpr int REG_MMA = 168;   // MMA: fragment-heavy
 constexpr int REG_PREP = 160;  // Prep: scalar computation
+
+// MMA atom alias
+using MMA_TF32 = cute::SM80_16x8x8_F32TF32TF32F32_TN;
+
+// Helper: reinterpret float as uint32_t for MMA operand
+__forceinline__ __device__ uint32_t
+f2u(float f) {
+    return reinterpret_cast<uint32_t&>(f);
+}
 
 // =====================================================================
 // WG Role Assignment
@@ -126,7 +136,6 @@ struct SharedStorage {
     alignas(16) cute::uint64_t bar_dA_ready;             // dAqk, dAkk, beta loaded
 
     // Async pipelines: Prep → MMA
-    alignas(16) cute::uint64_t bar_mask_ready;          // raw dA data ready (Prep notifies MMA)
     alignas(16) cute::uint64_t bar_kg_ready[NUM_BUF];   // KG double-buffered
     alignas(16) cute::uint64_t bar_qg_ready[NUM_BUF];   // QG double-buffered
     alignas(16) cute::uint64_t bar_kbg_ready[NUM_BUF];  // KBG double-buffered
@@ -214,7 +223,6 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
         cute::initialize_barrier(smem->bar_dA_ready, 2);  // TMA (arrive_expect_tx) + warp1 explicit arrive
 
         // Async barriers: Prep → MMA (arrival count = 256 for Prep WGs)
-        cute::initialize_barrier(smem->bar_mask_ready, 256);
         for (int i = 0; i < NUM_BUF; ++i) {
             cute::initialize_barrier(smem->bar_kg_ready[i], 256);
             cute::initialize_barrier(smem->bar_qg_ready[i], 256);
@@ -245,7 +253,6 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
     int buf_idx = 0;                     // double-buffer index for ki data
     int phase_qkg[NUM_BUF] = {0, 0};     // barrier phase for qkg_pipeline (Q,K,G + dQ,dK,dG)
     int phase_dA = 0;                    // barrier phase for dA_pipeline (single)
-    int phase_mask = 0;                  // barrier phase for mask_pipeline (single)
     int phase_kg[NUM_BUF] = {0, 0};      // barrier phase for kg_pipeline
     int phase_qg[NUM_BUF] = {0, 0};      // barrier phase for qg_pipeline
     int phase_kbg[NUM_BUF] = {0, 0};     // barrier phase for kbg_pipeline
@@ -392,18 +399,22 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
         // Warp3: Phase 4 TMA store dB
 
         // =================================================================
-        // WG1: MMA — mma.sync 4-pass sub-chunk loop (Phase 1: placeholder)
+        // WG1: MMA — mma.sync 4-pass sub-chunk loop
         // =================================================================
     } else if (role == WGRole::MMA) {
         cutlass::arch::warpgroup_reg_alloc<REG_MMA>();
 
-        // Phase 1: MMA WG waits for dA to be ready, then does nothing
-        // (Phase 3 will implement the actual 4-pass mma.sync loop)
+        // Thread mapping within WG1 (128 threads = 4 warps)
+        const int warp_id = idx_in_wg / 32;  // 0..3, each warp handles N=8 cols
+        const int lane_id = idx_in_wg % 32;
+        const int group_id = lane_id / 4;       // 0..7 (row within 16-row tile)
+        const int lane_in_group = lane_id % 4;  // 0..3 (K-stride)
+
+        // N-dimension column offset for this warp
+        const int n_offset = warp_id * 8;
+
         for (; tile_scheduler.is_valid(); tile_scheduler.advance()) {
             int tid = tile_scheduler.get_current_tile_id();
-
-            // Wait for Prep to signal dA data ready
-            cute::wait_barrier(smem->bar_mask_ready, phase_mask);
 
             auto blk_coord = TileScheduler::decode_tile_coord(tid, params.h, chunk_indices_ptr, cu_len_ptr);
             int batch_idx = get<0>(blk_coord);
@@ -411,24 +422,299 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
             int tile_idx = get<2>(blk_coord);
             int sub_seq_len = min(T_TILE, seq_len - tile_idx * T_TILE);
 
+            // Wait for dAqk/dAkk to be loaded (once per tile)
+            cute::wait_barrier(smem->bar_dA_ready, phase_dA);
+
             for (int k_idx = 0; k_idx < K_ITERATION; ++k_idx) {
                 int cur_buf = k_idx % NUM_BUF;
 
-                // Wait for KG ready
+                // Wait for B operands
                 cute::wait_barrier(smem->bar_kg_ready[cur_buf], phase_kg[cur_buf]);
-
-                // Wait for QG ready
                 cute::wait_barrier(smem->bar_qg_ready[cur_buf], phase_qg[cur_buf]);
-
-                // Wait for KBG ready
                 cute::wait_barrier(smem->bar_kbg_ready[cur_buf], phase_kbg[cur_buf]);
 
-                // Phase 1 placeholder: just write zeros to dQ/dK output buffers
-                // TODO(Phase 3): Implement 4-pass mma.sync sub-chunk loop
-                for (int elem = idx_in_wg; elem < T_TILE * K_TILE; elem += 128) {
-                    smem->smem_dq_out[cur_buf][elem] = 0.0f;
-                    smem->smem_dk_out[cur_buf][elem] = 0.0f;
+                // SMEM pointers for this ki
+                const float* daqk = smem->smem_daqk.data();
+                const float* dakk = smem->smem_dakk.data();
+                const float* kg = smem->smem_kg[cur_buf].data();
+                const float* qg = smem->smem_qg[cur_buf].data();
+                const float* kbg = smem->smem_kbg[cur_buf].data();
+                const float* g_smem = smem->smem_g[cur_buf].data();
+
+                // ─────────────────────────────────────────────────────
+                // CuTe SM80_16x8x8_F32TF32TF32F32_TN register mapping
+                // (colex linearization of MMA_Traits layouts):
+                //   A[M=16,K=8]: a0→[gid, lig], a1→[gid+8, lig],
+                //                a2→[gid, lig+4], a3→[gid+8, lig+4]
+                //   B[N=8,K=8]:  b0→[gid, lig], b1→[gid, lig+4]
+                //     (B is [N,K] col-major; k=lig maps to KG row, n=gid maps to d-col)
+                //   C[M=16,N=8]: c0→[gid, lig*2], c1→[gid, lig*2+1],
+                //                c2→[gid+8, lig*2], c3→[gid+8, lig*2+1]
+                // where lig = lane_in_group, gid = group_id
+                // ─────────────────────────────────────────────────────
+
+                // C output column offsets (two adjacent cols per thread)
+                const int c_col0 = n_offset + lane_in_group * 2;
+                const int c_col1 = c_col0 + 1;
+
+                // ── Pass 1: dQ = tril(dAqk, 0) × KG ──
+                for (int is = 0; is < 4; ++is) {
+                    float c0 = 0.0f, c1 = 0.0f, c2 = 0.0f, c3 = 0.0f;
+                    const int c_row0 = is * 16 + group_id;
+                    const int c_row1 = c_row0 + 8;
+
+                    for (int js = 0; js <= is; ++js) {
+                        float t0 = 0.0f, t1 = 0.0f, t2 = 0.0f, t3 = 0.0f;
+
+                        for (int k_inner = 0; k_inner < 2; ++k_inner) {
+                            // A: a0→dAqk[gid, lig], a1→[gid+8, lig],
+                            //    a2→[gid, lig+4], a3→[gid+8, lig+4]
+                            int a_row0 = is * 16 + group_id;
+                            int a_row1 = a_row0 + 8;
+                            int a_k0 = js * 16 + k_inner * 8 + lane_in_group;
+                            int a_k1 = a_k0 + 4;
+
+                            float a0 = daqk[a_row0 * T_TILE + a_k0];
+                            float a1 = daqk[a_row1 * T_TILE + a_k0];
+                            float a2 = daqk[a_row0 * T_TILE + a_k1];
+                            float a3 = daqk[a_row1 * T_TILE + a_k1];
+
+                            // Causal mask: j <= i  (col > row → zero)
+                            if (is == js) {
+                                if (a_k0 > a_row0)
+                                    a0 = 0.0f;
+                                if (a_k0 > a_row1)
+                                    a1 = 0.0f;
+                                if (a_k1 > a_row0)
+                                    a2 = 0.0f;
+                                if (a_k1 > a_row1)
+                                    a3 = 0.0f;
+                            }
+
+                            // B: b0→B[n=gid,k=lig] → KG[k_row, d_col]
+                            //    k_row = js*16 + k_inner*8 + lig, d_col = n_offset + gid
+                            int b_k0 = js * 16 + k_inner * 8 + lane_in_group;
+                            float b0 = kg[b_k0 * K_TILE + n_offset + group_id];
+                            float b1 = kg[(b_k0 + 4) * K_TILE + n_offset + group_id];
+
+                            MMA_TF32::fma(
+                                t0, t1, t2, t3, f2u(a0), f2u(a1), f2u(a2), f2u(a3), f2u(b0), f2u(b1), t0, t1, t2, t3);
+                        }
+
+                        // Scaling: exp2f(G[i,d] - G_norm_js[d])
+                        // G_norm cancels with KG's exp2(G_norm - G[j]): net = exp2(G[i]-G[j])
+                        float gn0 = g_smem[(js * 16) * K_TILE + c_col0];
+                        float gn1 = g_smem[(js * 16) * K_TILE + c_col1];
+
+                        c0 += t0 * exp2f(g_smem[c_row0 * K_TILE + c_col0] - gn0);
+                        c1 += t1 * exp2f(g_smem[c_row0 * K_TILE + c_col1] - gn1);
+                        c2 += t2 * exp2f(g_smem[c_row1 * K_TILE + c_col0] - gn0);
+                        c3 += t3 * exp2f(g_smem[c_row1 * K_TILE + c_col1] - gn1);
+                    }
+
+                    // R2S: write dQ fragment to smem_dq_out
+                    smem->smem_dq_out[cur_buf][c_row0 * K_TILE + c_col0] = c0;
+                    smem->smem_dq_out[cur_buf][c_row0 * K_TILE + c_col1] = c1;
+                    smem->smem_dq_out[cur_buf][c_row1 * K_TILE + c_col0] = c2;
+                    smem->smem_dq_out[cur_buf][c_row1 * K_TILE + c_col1] = c3;
                 }
+
+                // ── Pass 2: dK_lower = tril(dAkk, 0) × KG (including diagonal) ──
+                float dk_reg[4 * 4];
+                for (int i = 0; i < 16; ++i)
+                    dk_reg[i] = 0.0f;
+
+                for (int is = 0; is < 4; ++is) {
+                    float c0 = 0.0f, c1 = 0.0f, c2 = 0.0f, c3 = 0.0f;
+
+                    for (int js = 0; js <= is; ++js) {
+                        float t0 = 0.0f, t1 = 0.0f, t2 = 0.0f, t3 = 0.0f;
+
+                        for (int k_inner = 0; k_inner < 2; ++k_inner) {
+                            int a_row0 = is * 16 + group_id;
+                            int a_row1 = a_row0 + 8;
+                            int a_k0 = js * 16 + k_inner * 8 + lane_in_group;
+                            int a_k1 = a_k0 + 4;
+
+                            float a0 = dakk[a_row0 * T_TILE + a_k0];
+                            float a1 = dakk[a_row1 * T_TILE + a_k0];
+                            float a2 = dakk[a_row0 * T_TILE + a_k1];
+                            float a3 = dakk[a_row1 * T_TILE + a_k1];
+
+                            // Causal mask on diagonal: i >= j (col <= row)
+                            if (is == js) {
+                                if (a_k0 > a_row0)
+                                    a0 = 0.0f;
+                                if (a_k0 > a_row1)
+                                    a1 = 0.0f;
+                                if (a_k1 > a_row0)
+                                    a2 = 0.0f;
+                                if (a_k1 > a_row1)
+                                    a3 = 0.0f;
+                            }
+
+                            int b_k0 = js * 16 + k_inner * 8 + lane_in_group;
+                            float b0 = kg[b_k0 * K_TILE + n_offset + group_id];
+                            float b1 = kg[(b_k0 + 4) * K_TILE + n_offset + group_id];
+
+                            MMA_TF32::fma(
+                                t0, t1, t2, t3, f2u(a0), f2u(a1), f2u(a2), f2u(a3), f2u(b0), f2u(b1), t0, t1, t2, t3);
+                        }
+
+                        int cr0 = is * 16 + group_id;
+                        int cr1 = cr0 + 8;
+                        float gn0 = g_smem[(js * 16) * K_TILE + c_col0];
+                        float gn1 = g_smem[(js * 16) * K_TILE + c_col1];
+
+                        c0 += t0 * exp2f(g_smem[cr0 * K_TILE + c_col0] - gn0);
+                        c1 += t1 * exp2f(g_smem[cr0 * K_TILE + c_col1] - gn1);
+                        c2 += t2 * exp2f(g_smem[cr1 * K_TILE + c_col0] - gn0);
+                        c3 += t3 * exp2f(g_smem[cr1 * K_TILE + c_col1] - gn1);
+                    }
+
+                    dk_reg[is * 4 + 0] = c0;
+                    dk_reg[is * 4 + 1] = c1;
+                    dk_reg[is * 4 + 2] = c2;
+                    dk_reg[is * 4 + 3] = c3;
+                }
+
+                // ── Pass 3+4: dK_upper = triu(dAqk)^T × QG + strict_triu(dAkk)^T × KBG ──
+                float dkt_reg[4 * 4];
+                for (int i = 0; i < 16; ++i)
+                    dkt_reg[i] = 0.0f;
+
+                for (int js = 0; js < 4; ++js) {
+                    float c0 = 0.0f, c1 = 0.0f, c2 = 0.0f, c3 = 0.0f;
+
+                    // Pass 3: dAqk^T × QG (is >= js)
+                    for (int is = js; is < 4; ++is) {
+                        float t0 = 0.0f, t1 = 0.0f, t2 = 0.0f, t3 = 0.0f;
+
+                        for (int k_inner = 0; k_inner < 2; ++k_inner) {
+                            // Transposed A: A_T[m, k] = dAqk[k, m]
+                            // a0→A_T[gid,lig] = dAqk[is*16+k8+lig, js*16+gid]
+                            // a1→A_T[gid+8,lig] = dAqk[is*16+k8+lig, js*16+gid+8]
+                            // a2→A_T[gid,lig+4] = dAqk[is*16+k8+lig+4, js*16+gid]
+                            // a3→A_T[gid+8,lig+4] = dAqk[is*16+k8+lig+4, js*16+gid+8]
+                            int daqk_k0 = is * 16 + k_inner * 8 + lane_in_group;
+                            int daqk_k1 = daqk_k0 + 4;
+                            int m0 = js * 16 + group_id;
+                            int m1 = m0 + 8;
+
+                            float a0 = daqk[daqk_k0 * T_TILE + m0];
+                            float a1 = daqk[daqk_k0 * T_TILE + m1];
+                            float a2 = daqk[daqk_k1 * T_TILE + m0];
+                            float a3 = daqk[daqk_k1 * T_TILE + m1];
+
+                            // Causal mask: keep elements where i >= j
+                            // i = daqk_k{0,1} (original row), j = m{0,1} (original col)
+                            // zero when i < j (i.e., k < m in transposed view)
+                            if (is == js) {
+                                if (daqk_k0 < m0)
+                                    a0 = 0.0f;
+                                if (daqk_k0 < m1)
+                                    a1 = 0.0f;
+                                if (daqk_k1 < m0)
+                                    a2 = 0.0f;
+                                if (daqk_k1 < m1)
+                                    a3 = 0.0f;
+                            }
+
+                            // B: QG, b0→B[n=gid,k=lig] → QG[k_row, d_col]
+                            int b_k0 = is * 16 + k_inner * 8 + lane_in_group;
+                            float b0 = qg[b_k0 * K_TILE + n_offset + group_id];
+                            float b1 = qg[(b_k0 + 4) * K_TILE + n_offset + group_id];
+
+                            MMA_TF32::fma(
+                                t0, t1, t2, t3, f2u(a0), f2u(a1), f2u(a2), f2u(a3), f2u(b0), f2u(b1), t0, t1, t2, t3);
+                        }
+
+                        // K-side scaling: exp2f(clamp(G_norm_is - G[j], -126, 126))
+                        int cr0 = js * 16 + group_id;
+                        int cr1 = cr0 + 8;
+                        float gn0 = g_smem[(is * 16) * K_TILE + c_col0];
+                        float gn1 = g_smem[(is * 16) * K_TILE + c_col1];
+
+                        t0 *= exp2f(fminf(fmaxf(gn0 - g_smem[cr0 * K_TILE + c_col0], -126.0f), 126.0f));
+                        t1 *= exp2f(fminf(fmaxf(gn1 - g_smem[cr0 * K_TILE + c_col1], -126.0f), 126.0f));
+                        t2 *= exp2f(fminf(fmaxf(gn0 - g_smem[cr1 * K_TILE + c_col0], -126.0f), 126.0f));
+                        t3 *= exp2f(fminf(fmaxf(gn1 - g_smem[cr1 * K_TILE + c_col1], -126.0f), 126.0f));
+
+                        c0 += t0;
+                        c1 += t1;
+                        c2 += t2;
+                        c3 += t3;
+                    }
+
+                    // Pass 4: dAkk^T × KBG (is >= js, including diagonal)
+                    for (int is = js; is < 4; ++is) {
+                        float t0 = 0.0f, t1 = 0.0f, t2 = 0.0f, t3 = 0.0f;
+
+                        for (int k_inner = 0; k_inner < 2; ++k_inner) {
+                            int dakk_k0 = is * 16 + k_inner * 8 + lane_in_group;
+                            int dakk_k1 = dakk_k0 + 4;
+                            int m0 = js * 16 + group_id;
+                            int m1 = m0 + 8;
+
+                            float a0 = dakk[dakk_k0 * T_TILE + m0];
+                            float a1 = dakk[dakk_k0 * T_TILE + m1];
+                            float a2 = dakk[dakk_k1 * T_TILE + m0];
+                            float a3 = dakk[dakk_k1 * T_TILE + m1];
+
+                            // Causal mask on diagonal: keep k >= m (j >= i)
+                            if (is == js) {
+                                if (dakk_k0 < m0)
+                                    a0 = 0.0f;
+                                if (dakk_k0 < m1)
+                                    a1 = 0.0f;
+                                if (dakk_k1 < m0)
+                                    a2 = 0.0f;
+                                if (dakk_k1 < m1)
+                                    a3 = 0.0f;
+                            }
+
+                            int b_k0 = is * 16 + k_inner * 8 + lane_in_group;
+                            float b0 = kbg[b_k0 * K_TILE + n_offset + group_id];
+                            float b1 = kbg[(b_k0 + 4) * K_TILE + n_offset + group_id];
+
+                            MMA_TF32::fma(
+                                t0, t1, t2, t3, f2u(a0), f2u(a1), f2u(a2), f2u(a3), f2u(b0), f2u(b1), t0, t1, t2, t3);
+                        }
+
+                        int cr0 = js * 16 + group_id;
+                        int cr1 = cr0 + 8;
+                        float gn0 = g_smem[(is * 16) * K_TILE + c_col0];
+                        float gn1 = g_smem[(is * 16) * K_TILE + c_col1];
+
+                        t0 *= exp2f(fminf(fmaxf(gn0 - g_smem[cr0 * K_TILE + c_col0], -126.0f), 126.0f));
+                        t1 *= exp2f(fminf(fmaxf(gn1 - g_smem[cr0 * K_TILE + c_col1], -126.0f), 126.0f));
+                        t2 *= exp2f(fminf(fmaxf(gn0 - g_smem[cr1 * K_TILE + c_col0], -126.0f), 126.0f));
+                        t3 *= exp2f(fminf(fmaxf(gn1 - g_smem[cr1 * K_TILE + c_col1], -126.0f), 126.0f));
+
+                        c0 += t0;
+                        c1 += t1;
+                        c2 += t2;
+                        c3 += t3;
+                    }
+
+                    dkt_reg[js * 4 + 0] = c0;
+                    dkt_reg[js * 4 + 1] = c1;
+                    dkt_reg[js * 4 + 2] = c2;
+                    dkt_reg[js * 4 + 3] = c3;
+                }
+
+                // ── R2S: Combine dK_lower + dK_upper → smem_dk_out ──
+                {
+                    for (int s = 0; s < 4; ++s) {
+                        int r0 = s * 16 + group_id;
+                        int r1 = r0 + 8;
+                        smem->smem_dk_out[cur_buf][r0 * K_TILE + c_col0] = dk_reg[s * 4 + 0] + dkt_reg[s * 4 + 0];
+                        smem->smem_dk_out[cur_buf][r0 * K_TILE + c_col1] = dk_reg[s * 4 + 1] + dkt_reg[s * 4 + 1];
+                        smem->smem_dk_out[cur_buf][r1 * K_TILE + c_col0] = dk_reg[s * 4 + 2] + dkt_reg[s * 4 + 2];
+                        smem->smem_dk_out[cur_buf][r1 * K_TILE + c_col1] = dk_reg[s * 4 + 3] + dkt_reg[s * 4 + 3];
+                    }
+                }
+
                 fence_view_async_shared();
 
                 // Signal Prep: dQ+dK for this ki ready
@@ -439,7 +725,7 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
                 phase_kbg[cur_buf] ^= 1;
             }
 
-            phase_mask ^= 1;
+            phase_dA ^= 1;
         }
 
         // =================================================================
@@ -464,10 +750,6 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
             int token_offset = cu_len_ptr[batch_idx];
             int seq_len = cu_len_ptr[batch_idx + 1] - cu_len_ptr[batch_idx];
             int sub_seq_len = min(T_TILE, seq_len - tile_idx * T_TILE);
-
-            // ── Notify MMA: raw dA data ready (mma.sync will do on-the-fly mask) ──
-            fence_view_async_shared();
-            cute::arrive_barrier(smem->bar_mask_ready);
 
             // Initialize dB accumulator
             if (prep_tid < T_TILE) {
