@@ -1,6 +1,6 @@
 #pragma once
 
-#include "tile_scheduler.h"
+#include "kda/sm90/bwd/tile_scheduler.h"
 
 struct KDA_bwd_intra_params {
     using index_t = int64_t;
