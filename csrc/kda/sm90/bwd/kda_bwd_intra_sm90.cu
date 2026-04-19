@@ -10,6 +10,7 @@
 #include <cute/atom/copy_atom.hpp>
 #include <cute/atom/copy_traits_sm90_tma.hpp>
 #include <cute/atom/mma_atom.hpp>
+#include <cute/swizzle_layout.hpp>
 #include <cute/tensor.hpp>
 #include <cutlass/arch/barrier.h>
 #include <cutlass/bfloat16.h>
@@ -38,31 +39,25 @@ using TiledMMA_t = TiledMMA<MMA_Atom_TF32, Layout<Shape<_1, _4, _1>>>;
 // Tiled shape: M=16, N=32, K=8. For K=16 we iterate k=0,1.
 
 // SMEM layouts (row-major, col stride-1)
-using SmemLayoutQK = Layout<Shape<Int<BC>, Int<BK>>, Stride<Int<BK>, _1>>;    // [16,32] bf16
-using SmemLayoutG = Layout<Shape<Int<BC>, Int<BK>>, Stride<Int<BK>, _1>>;     // [16,32] fp32
-using SmemLayoutDA = Layout<Shape<Int<BC>, Int<BC>>, Stride<Int<BC>, _1>>;    // [16,16] fp32
-using SmemLayoutB_op = Layout<Shape<Int<BK>, Int<BC>>, Stride<Int<BC>, _1>>;  // [32,16] fp32
-using SmemLayoutAcc = Layout<Shape<Int<BC>, Int<BK>>, Stride<Int<BK>, _1>>;   // [16,32] fp32
-
-// 2D smem layouts for TMA: (rows=BC, cols=BK or BC)
-// gmem is flattened to (total_len, H*D) stride (H*D, 1), head offset folded into inner coord
-using SmemLayoutQK_TMA = Layout<Shape<Int<BC>, Int<BK>>, Stride<Int<BK>, _1>>;
-using SmemLayoutG_TMA = Layout<Shape<Int<BC>, Int<BK>>, Stride<Int<BK>, _1>>;
-using SmemLayoutDA_TMA = Layout<Shape<Int<BC>, Int<BC>>, Stride<Int<BC>, _1>>;
+// [16,32] bf16, row_bytes=64B → Swizzle<2,3,3>, loaded via cp.async
+using SmemLayoutQK = decltype(composition(Swizzle<2, 3, 3>{}, Layout<Shape<Int<BC>, Int<BK>>, Stride<Int<BK>, _1>>{}));
+// [16,32] fp32, row_bytes=128B → Swizzle<3,2,3> (128B mode), loaded via cooperative copy
+using SmemLayoutG = decltype(composition(Swizzle<3, 2, 3>{}, Layout<Shape<Int<BC>, Int<BK>>, Stride<Int<BK>, _1>>{}));
+// [16,16] fp32, row_bytes=64B → Swizzle<2,2,3>, loaded via cp.async (Phase 1) / cooperative (Phase 2)
+using SmemLayoutDA = decltype(composition(Swizzle<2, 2, 3>{}, Layout<Shape<Int<BC>, Int<BC>>, Stride<Int<BC>, _1>>{}));
+// [32,16] fp32, row_bytes=64B → Swizzle<2,2,3> (TMA 64B mode)
+using SmemLayoutB_op =
+    decltype(composition(Swizzle<2, 2, 3>{}, Layout<Shape<Int<BK>, Int<BC>>, Stride<Int<BC>, _1>>{}));
+// [16,32] fp32, row_bytes=128B → Swizzle<3,2,3> (128B mode)
+using SmemLayoutAcc = decltype(composition(Swizzle<3, 2, 3>{}, Layout<Shape<Int<BC>, Int<BK>>, Stride<Int<BK>, _1>>{}));
 
 // S2R atom for MMA operand loads
 using S2RAtom = Copy_Atom<UniversalCopy<float>, float>;
-
-// TMA transaction sizes (bytes)
-static constexpr int TMA_BYTES_QK = BC * BK * sizeof(__nv_bfloat16);  // 16*32*2 = 1024
-static constexpr int TMA_BYTES_G = BC * BK * sizeof(float);           // 16*32*4 = 2048
-static constexpr int TMA_BYTES_DA = BC * BC * sizeof(float);          // 16*16*4 = 1024
 
 // ============================================================
 // Shared memory
 // ============================================================
 struct SmemStorage {
-    // TMA targets need 128-byte alignment
     array_aligned<__nv_bfloat16, cosize_v<SmemLayoutQK>, 128> s_q;  // [16,32] persistent bf16
     array_aligned<__nv_bfloat16, cosize_v<SmemLayoutQK>, 128> s_k;  // [16,32] persistent bf16
     array_aligned<float, cosize_v<SmemLayoutG>, 128> s_g;           // [16,32] persistent fp32
@@ -76,18 +71,7 @@ struct SmemStorage {
         array_aligned<float, cosize_v<SmemLayoutAcc>> s_acc;  // Phase 1: db reduction scratch
     };
     array_aligned<float, BC> s_db;  // [16] db output
-    alignas(8) uint64_t mbar;       // TMA mbarrier
 };
-
-// ============================================================
-// TMA load helper: issues a 2D TMA load
-// Only thread 0 should call this. Caller manages barrier.
-// Coordinates: crd0 = inner dim offset, crd1 = row offset
-// ============================================================
-__device__ __forceinline__ void
-tma_load_2d(const cute::TmaDescriptor& desc, uint64_t* mbar_ptr, void* smem_ptr, int32_t crd_col, int32_t crd_row) {
-    SM90_TMA_LOAD::copy(&desc, mbar_ptr, /*cache_hint=*/0, smem_ptr, crd_col, crd_row);
-}
 
 // ============================================================
 // MMA helper: acc += A[16,16] @ B[32,16]^T → C[16,32]
@@ -223,8 +207,11 @@ __launch_bounds__(NUM_THREADS) kda_bwd_intra_kernel_sm90(__grid_constant__ const
     auto mDq = make_seq_hd(dq_ptr, K);
     auto mDk = make_seq_hd(dk_ptr, K);
     auto mDg = make_seq_hd(dg_ptr, K);
+    auto mDAqk_g = make_seq_hd(dAqk_ptr, BT);  // [T_seq, BT] for cp.async Phase 1
+    auto mDAkk_g = make_seq_hd(dAkk_ptr, BT);
 
     auto tile_hk = make_shape(Int<BC>{}, Int<BK>{});
+    auto tile_da = make_shape(Int<BC>{}, Int<BC>{});  // [16,16] for dA tiles
 
     // ── SMEM tensor views ──
     auto sQ = make_tensor(make_smem_ptr(smem.s_q.data()), SmemLayoutQK{});
@@ -236,47 +223,56 @@ __launch_bounds__(NUM_THREADS) kda_bwd_intra_kernel_sm90(__grid_constant__ const
     auto sDAqk = make_tensor(make_smem_ptr(smem.s_dA_qk.data()), SmemLayoutDA{});
     auto sDAkk = make_tensor(make_smem_ptr(smem.s_dA_kk.data()), SmemLayoutDA{});
 
-    // ── Prefetch TMA descriptors + initialize mbarrier ──
-    if (warp_idx == 0) {
-        if (cute::elect_one_sync()) {
-            cute::prefetch_tma_descriptor(&params.tma_q);
-            cute::prefetch_tma_descriptor(&params.tma_k);
-            cute::prefetch_tma_descriptor(&params.tma_g);
-            cute::prefetch_tma_descriptor(&params.tma_dAqk);
-            cute::prefetch_tma_descriptor(&params.tma_dAkk);
-            cutlass::arch::ClusterTransactionBarrier::init(&smem.mbar, 1);
-        }
-    }
-    cutlass::arch::fence_barrier_init();
-    // Ensure barrier init is visible to all threads before any barrier operations.
-    // Critical for serialized blocks that reuse smem with stale mbarrier state.
-    __syncthreads();
-
-    // TMA coordinates: 2D flattened (total_len, H*D) → head offset in inner dim
-    const int32_t crd_col = i_h * K + i_k * BK;   // inner: head offset + K-tile offset
-    const int32_t crd_row = bos + tile_row * BC;  // outer: row in total_len
-
-    // ── Load persistent tiles via TMA ──
-    int tma_phase = 0;
+    // ── Load persistent tiles via cp.async: Q, K, G + cooperative beta ──
     {
-        if (warp_idx == 0) {
-            if (cute::elect_one_sync()) {
-                constexpr int total_tma_bytes = TMA_BYTES_QK * 2 + TMA_BYTES_G;
-                cutlass::arch::ClusterTransactionBarrier::arrive_and_expect_tx(&smem.mbar, total_tma_bytes);
-                tma_load_2d(params.tma_q, &smem.mbar, smem.s_q.data(), crd_col, crd_row);
-                tma_load_2d(params.tma_k, &smem.mbar, smem.s_k.data(), crd_col, crd_row);
-                tma_load_2d(params.tma_g, &smem.mbar, smem.s_g.data(), crd_col, crd_row);
+        // Q: bf16 [16,32] = 512 elems, 16B/chunk = 8 bf16 → 64 chunks
+        {
+            auto gQ_tile = local_tile(mQ, tile_hk, make_coord(tile_row, i_k));
+            constexpr int Q_CHUNKS = (BC * BK) / 8;  // 64
+            for (int ci = tid; ci < Q_CHUNKS; ci += NUM_THREADS) {
+                int elem = ci * 8;
+                int r = elem / BK;
+                int c = elem % BK;
+                uint32_t dst = cute::cast_smem_ptr_to_uint(&sQ(r, c));
+                const __nv_bfloat16* src = &gQ_tile(r, c);
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"(src));
             }
         }
-        // Load beta cooperatively while TMA is in-flight
+        // K: bf16 [16,32] = 512 elems → 64 chunks
+        {
+            auto gK_tile = local_tile(mK, tile_hk, make_coord(tile_row, i_k));
+            constexpr int K_CHUNKS = (BC * BK) / 8;  // 64
+            for (int ci = tid; ci < K_CHUNKS; ci += NUM_THREADS) {
+                int elem = ci * 8;
+                int r = elem / BK;
+                int c = elem % BK;
+                uint32_t dst = cute::cast_smem_ptr_to_uint(&sK(r, c));
+                const __nv_bfloat16* src = &gK_tile(r, c);
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"(src));
+            }
+        }
+        // G: fp32 [16,32] = 512 elems, 16B/chunk = 4 fp32 → 128 chunks
+        {
+            auto gG_tile = local_tile(mG, tile_hk, make_coord(tile_row, i_k));
+            constexpr int G_CHUNKS = (BC * BK) / 4;  // 128
+            for (int ci = tid; ci < G_CHUNKS; ci += NUM_THREADS) {
+                int elem = ci * 4;
+                int r = elem / BK;
+                int c = elem % BK;
+                uint32_t dst = cute::cast_smem_ptr_to_uint(&sG(r, c));
+                const float* src = &gG_tile(r, c);
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"(src));
+            }
+        }
+        // Beta: cooperative (scalar per row, not worth cp.async)
         {
             auto gBeta_tile = local_tile(mBeta, Int<BC>{}, tile_row);
             if (tid < BC) {
                 smem.s_beta[tid] = __bfloat162float(gBeta_tile(tid));
             }
         }
-        cutlass::arch::ClusterTransactionBarrier::wait(&smem.mbar, tma_phase);
-        tma_phase ^= 1;
+        asm volatile("cp.async.commit_group;\n");
+        asm volatile("cp.async.wait_group 0;\n");
         __syncthreads();
     }
 
@@ -296,13 +292,21 @@ __launch_bounds__(NUM_THREADS) kda_bwd_intra_kernel_sm90(__grid_constant__ const
         for (int i_j = 0; i_j < i_i; ++i_j) {
             int j_tile = i_t * NC + i_j;
 
-            // Issue TMA for dAqk + dAkk (async, single barrier)
+            // cp.async load dAqk + dAkk: fp32 [16,16] = 256 elems, 4 per chunk → 64 chunks
             {
-                int32_t da_col = i_h * BT + i_j * BC;
-                if (warp_idx == 0 && cute::elect_one_sync()) {
-                    cutlass::arch::ClusterTransactionBarrier::arrive_and_expect_tx(&smem.mbar, TMA_BYTES_DA * 2);
-                    tma_load_2d(params.tma_dAqk, &smem.mbar, smem.s_dA_qk.data(), da_col, crd_row);
-                    tma_load_2d(params.tma_dAkk, &smem.mbar, smem.s_dA_kk.data(), da_col, crd_row);
+                auto gDAqk_j = local_tile(mDAqk_g, tile_da, make_coord(tile_row, i_j));
+                auto gDAkk_j = local_tile(mDAkk_g, tile_da, make_coord(tile_row, i_j));
+                constexpr int DA_CHUNKS = (BC * BC) / 4;  // 64
+                for (int ci = tid; ci < DA_CHUNKS; ci += NUM_THREADS) {
+                    int elem = ci * 4;
+                    int r = elem / BC;
+                    int c = elem % BC;
+                    uint32_t dst_qk = cute::cast_smem_ptr_to_uint(&sDAqk(r, c));
+                    uint32_t dst_kk = cute::cast_smem_ptr_to_uint(&sDAkk(r, c));
+                    const float* src_qk = &gDAqk_j(r, c);
+                    const float* src_kk = &gDAkk_j(r, c);
+                    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst_qk), "l"(src_qk));
+                    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst_kk), "l"(src_kk));
                 }
             }
 
@@ -319,9 +323,9 @@ __launch_bounds__(NUM_THREADS) kda_bwd_intra_kernel_sm90(__grid_constant__ const
                 }
             }
 
-            // Wait TMA dA + fence KG writes
-            cutlass::arch::ClusterTransactionBarrier::wait(&smem.mbar, tma_phase);
-            tma_phase ^= 1;
+            // Wait for cp.async dA + fence KG writes
+            asm volatile("cp.async.commit_group;\n");
+            asm volatile("cp.async.wait_group 0;\n");
             __syncthreads();
 
             gemm_m16n32k16(smem.s_dA_qk.data(), smem.s_KG.data(), dq2_acc, tid);
@@ -350,13 +354,21 @@ __launch_bounds__(NUM_THREADS) kda_bwd_intra_kernel_sm90(__grid_constant__ const
         }
         __syncthreads();
 
-        // TMA load dAqk + dAkk diagonal tile (async)
+        // cp.async load dAqk + dAkk diagonal tile
         {
-            int32_t da_col = i_h * BT + i_i * BC;
-            if (warp_idx == 0 && cute::elect_one_sync()) {
-                cutlass::arch::ClusterTransactionBarrier::arrive_and_expect_tx(&smem.mbar, TMA_BYTES_DA * 2);
-                tma_load_2d(params.tma_dAqk, &smem.mbar, smem.s_dA_qk.data(), da_col, crd_row);
-                tma_load_2d(params.tma_dAkk, &smem.mbar, smem.s_dA_kk.data(), da_col, crd_row);
+            auto gDAqk_diag = local_tile(mDAqk_g, tile_da, make_coord(tile_row, i_i));
+            auto gDAkk_diag = local_tile(mDAkk_g, tile_da, make_coord(tile_row, i_i));
+            constexpr int DA_CHUNKS = (BC * BC) / 4;  // 64
+            for (int ci = tid; ci < DA_CHUNKS; ci += NUM_THREADS) {
+                int elem = ci * 4;
+                int r = elem / BC;
+                int c = elem % BC;
+                uint32_t dst_qk = cute::cast_smem_ptr_to_uint(&sDAqk(r, c));
+                uint32_t dst_kk = cute::cast_smem_ptr_to_uint(&sDAkk(r, c));
+                const float* src_qk = &gDAqk_diag(r, c);
+                const float* src_kk = &gDAkk_diag(r, c);
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst_qk), "l"(src_qk));
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst_kk), "l"(src_kk));
             }
         }
 
@@ -369,9 +381,9 @@ __launch_bounds__(NUM_THREADS) kda_bwd_intra_kernel_sm90(__grid_constant__ const
             sKG(n, k_dim) = valid ? (__bfloat162float(sK(k_dim, n)) * exp2f(-g_diff)) : 0.f;
         }
 
-        // Wait TMA + fence
-        cutlass::arch::ClusterTransactionBarrier::wait(&smem.mbar, tma_phase);
-        tma_phase ^= 1;
+        // Wait for cp.async dA + fence KG writes
+        asm volatile("cp.async.commit_group;\n");
+        asm volatile("cp.async.wait_group 0;\n");
         __syncthreads();
 
         // Apply lower-triangular mask to both dAqk and dAkk
@@ -443,16 +455,27 @@ __launch_bounds__(NUM_THREADS) kda_bwd_intra_kernel_sm90(__grid_constant__ const
     }
 
     // ════════════════════════════════════════════════════════════════════════
-    // PHASE 1 EPILOGUE: store dQ output, db output
+    // PHASE 1 EPILOGUE: store dQ output, db output (coalesced via smem staging)
     // ════════════════════════════════════════════════════════════════════════
     {
         auto gDq_tile = local_tile(mDq, tile_hk, make_coord(tile_row, i_k));
         auto gDqOut_tile = local_tile(mDqOut, tile_hk, make_coord(tile_row, i_k));
+        auto sStage = make_tensor(make_smem_ptr(smem.s_acc.data()), SmemLayoutAcc{});
+
+        // Scatter: each thread computes final dq value and writes to smem
         for (int v = 0; v < 4; ++v) {
             int row, col;
             get_acc_row_col(tid, v, row, col);
-            if ((i_ti + row) < T_seq) {
-                gDqOut_tile(row, col) = __float2bfloat16(dq2_acc[v] + gDq_tile(row, col));
+            sStage(row, col) = dq2_acc[v] + gDq_tile(row, col);
+        }
+        __syncthreads();
+
+        // Coalesced store to gmem as bf16
+        for (int idx = tid; idx < BC * BK; idx += NUM_THREADS) {
+            int r = idx / BK;
+            int c = idx % BK;
+            if ((i_ti + r) < T_seq) {
+                gDqOut_tile(r, c) = __float2bfloat16(sStage(r, c));
             }
         }
         if (tid < BC && (i_ti + tid) < T_seq) {
@@ -569,24 +592,48 @@ __launch_bounds__(NUM_THREADS) kda_bwd_intra_kernel_sm90(__grid_constant__ const
     }
 
     // ════════════════════════════════════════════════════════════════════════
-    // FINAL EPILOGUE: dk_out, dg_out
+    // FINAL EPILOGUE: dk_out, dg_out (coalesced via smem staging)
     // ════════════════════════════════════════════════════════════════════════
+    __syncthreads();
     {
         auto gDk_tile = local_tile(mDk, tile_hk, make_coord(tile_row, i_k));
         auto gDkOut_tile = local_tile(mDkOut, tile_hk, make_coord(tile_row, i_k));
         auto gDg_tile = local_tile(mDg, tile_hk, make_coord(tile_row, i_k));
         auto gDgOut_tile = local_tile(mDgOut, tile_hk, make_coord(tile_row, i_k));
+        auto sStage = make_tensor(make_smem_ptr(smem.s_acc.data()), SmemLayoutAcc{});
 
+        // ── dg_out: scatter compute to smem, coalesced store fp32 ──
         for (int v = 0; v < 4; ++v) {
             int row, col;
             get_acc_row_col(tid, v, row, col);
-            if ((i_ti + row) < T_seq) {
-                float qv = __bfloat162float(sQ(row, col));
-                float kv = __bfloat162float(sK(row, col));
-                // dg_out = q * dq2_intra + (dk2_beta - dkt) * k + dg_upstream
-                gDgOut_tile(row, col) = qv * dq2_acc[v] + (dk2_acc[v] - dkt_acc[v]) * kv + gDg_tile(row, col);
-                // dk_out = bf16(dk2_beta + dk_upstream + dkt)
-                gDkOut_tile(row, col) = __float2bfloat16(dk2_acc[v] + gDk_tile(row, col) + dkt_acc[v]);
+            float qv = __bfloat162float(sQ(row, col));
+            float kv = __bfloat162float(sK(row, col));
+            sStage(row, col) = qv * dq2_acc[v] + (dk2_acc[v] - dkt_acc[v]) * kv + gDg_tile(row, col);
+        }
+        __syncthreads();
+
+        for (int idx = tid; idx < BC * BK; idx += NUM_THREADS) {
+            int r = idx / BK;
+            int c = idx % BK;
+            if ((i_ti + r) < T_seq) {
+                gDgOut_tile(r, c) = sStage(r, c);
+            }
+        }
+        __syncthreads();
+
+        // ── dk_out: scatter compute to smem, coalesced store bf16 ──
+        for (int v = 0; v < 4; ++v) {
+            int row, col;
+            get_acc_row_col(tid, v, row, col);
+            sStage(row, col) = dk2_acc[v] + gDk_tile(row, col) + dkt_acc[v];
+        }
+        __syncthreads();
+
+        for (int idx = tid; idx < BC * BK; idx += NUM_THREADS) {
+            int r = idx / BK;
+            int c = idx % BK;
+            if ((i_ti + r) < T_seq) {
+                gDkOut_tile(r, c) = __float2bfloat16(sStage(r, c));
             }
         }
     }
@@ -603,55 +650,8 @@ run_kda_bwd_intra_sm90(KDA_bwd_intra_params& params, cudaStream_t stream) {
     const int K = params.d;
     const int total = params.total_q_len;
 
-    // ── Create 2D TMA descriptors ──
-    // Flatten (total_len, H, D) → (total_len, H*D) with stride (H*D, 1)
-    // Head index folded into inner coordinate: crd0 = i_h * D + offset
-
-    // bf16 tensors: Q, K (use cutlass::bfloat16_t for TMA type recognition)
-    {
-        auto mQ = make_tensor(
-            make_gmem_ptr(reinterpret_cast<const cutlass::bfloat16_t*>(params.q_ptr)),
-            make_shape(total, H * K),
-            make_stride(H * K, Int<1>{}));
-        auto tma = make_tma_copy(SM90_TMA_LOAD{}, mQ, SmemLayoutQK_TMA{});
-        params.tma_q = *tma.get_tma_descriptor();
-    }
-    {
-        auto mK = make_tensor(
-            make_gmem_ptr(reinterpret_cast<const cutlass::bfloat16_t*>(params.k_ptr)),
-            make_shape(total, H * K),
-            make_stride(H * K, Int<1>{}));
-        auto tma = make_tma_copy(SM90_TMA_LOAD{}, mK, SmemLayoutQK_TMA{});
-        params.tma_k = *tma.get_tma_descriptor();
-    }
-
-    // fp32 tensors: G
-    {
-        auto mG = make_tensor(
-            make_gmem_ptr(reinterpret_cast<const float*>(params.g_ptr)),
-            make_shape(total, H * K),
-            make_stride(H * K, Int<1>{}));
-        auto tma = make_tma_copy(SM90_TMA_LOAD{}, mG, SmemLayoutG_TMA{});
-        params.tma_g = *tma.get_tma_descriptor();
-    }
-
-    // fp32 dA tensors: dAqk, dAkk  shape [total_len, H, BT] → (total_len, H*BT)
-    {
-        auto mDAqk = make_tensor(
-            make_gmem_ptr(reinterpret_cast<const float*>(params.dAqk_ptr)),
-            make_shape(total, H * BT),
-            make_stride(H * BT, Int<1>{}));
-        auto tma = make_tma_copy(SM90_TMA_LOAD{}, mDAqk, SmemLayoutDA_TMA{});
-        params.tma_dAqk = *tma.get_tma_descriptor();
-    }
-    {
-        auto mDAkk = make_tensor(
-            make_gmem_ptr(reinterpret_cast<const float*>(params.dAkk_ptr)),
-            make_shape(total, H * BT),
-            make_stride(H * BT, Int<1>{}));
-        auto tma = make_tma_copy(SM90_TMA_LOAD{}, mDAkk, SmemLayoutDA_TMA{});
-        params.tma_dAkk = *tma.get_tma_descriptor();
-    }
+    // All buffers now loaded via cp.async/cooperative in kernel (swizzled smem)
+    // TMA descriptors in params struct are unused but kept for ABI compatibility
 
     // ── Launch kernel ──
     dim3 grid = NaiveTileScheduler::get_grid_shape(params.tile_scheduler_params);
