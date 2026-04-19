@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cute/arch/copy_sm90_desc.hpp>
+
 #include "kda/sm90/bwd/tile_scheduler.h"
 
 struct KDA_bwd_intra_params {
@@ -27,6 +29,13 @@ struct KDA_bwd_intra_params {
     void* __restrict__ dg_out_ptr;         //[b, t, h, d]
     void* __restrict__ cu_seqlens_ptr;     //[b + 1]
     void* __restrict__ chunk_indices_ptr;  //[len(cu_seqlens) - 1]
+
+    // TMA descriptors for SM90 TMA loads (2D: flatten [total_len, H*D] stride [H*D, 1])
+    alignas(64) cute::TmaDescriptor tma_q;     // bf16 [total_len, H*K], box [BC, BK]
+    alignas(64) cute::TmaDescriptor tma_k;     // bf16 [total_len, H*K], box [BC, BK]
+    alignas(64) cute::TmaDescriptor tma_g;     // fp32 [total_len, H*K], box [BC, BK]
+    alignas(64) cute::TmaDescriptor tma_dAqk;  // fp32 [total_len, H*BT], box [BC, BC]
+    alignas(64) cute::TmaDescriptor tma_dAkk;  // fp32 [total_len, H*BT], box [BC, BC]
 
     NaiveTileScheduler::Params tile_scheduler_params;
 };
