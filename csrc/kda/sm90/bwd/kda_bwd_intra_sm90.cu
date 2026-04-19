@@ -45,9 +45,8 @@ using SmemLayoutQK = decltype(composition(Swizzle<2, 3, 3>{}, Layout<Shape<Int<B
 using SmemLayoutG = decltype(composition(Swizzle<3, 2, 3>{}, Layout<Shape<Int<BC>, Int<BK>>, Stride<Int<BK>, _1>>{}));
 // [16,16] fp32, row_bytes=64B → Swizzle<2,2,3>, loaded via cp.async (Phase 1) / cooperative (Phase 2)
 using SmemLayoutDA = decltype(composition(Swizzle<2, 2, 3>{}, Layout<Shape<Int<BC>, Int<BC>>, Stride<Int<BC>, _1>>{}));
-// [32,16] fp32, row_bytes=64B → Swizzle<2,2,3> (TMA 64B mode)
-using SmemLayoutB_op =
-    decltype(composition(Swizzle<2, 2, 3>{}, Layout<Shape<Int<BK>, Int<BC>>, Stride<Int<BC>, _1>>{}));
+// [32,16] fp32, padded stride 17 → gcd(17,32)=1 → zero bank conflicts for both row/col access
+using SmemLayoutB_op = Layout<Shape<Int<BK>, Int<BC>>, Stride<Int<BC + 1>, _1>>;
 // [16,32] fp32, row_bytes=128B → Swizzle<3,2,3> (128B mode)
 using SmemLayoutAcc = decltype(composition(Swizzle<3, 2, 3>{}, Layout<Shape<Int<BC>, Int<BK>>, Stride<Int<BK>, _1>>{}));
 
