@@ -141,9 +141,10 @@ def benchmark_bwd_intra_uniform():
     device = torch.device("cuda")
     chunk_size = BT
     T_vals = [512, 1024, 4096, 8192, 16384, 32768]
+    T_vals_b1 = [65536, 131072]  # Use B=1 for very large sequences
 
     print("=" * 100)
-    print(f"  Uniform-Length BwdIntra Benchmark: cuLA vs FLA Triton  B={B} H={H} D={D}")
+    print(f"  Uniform-Length BwdIntra Benchmark: cuLA vs FLA Triton  H={H} D={D}")
     print("=" * 100)
     print(
         f"{'B':>4} {'T':>7} │ {'dq_rmse':>10} {'dk_rmse':>10} {'db_rmse':>10} {'dg_rmse':>10}"
@@ -151,9 +152,10 @@ def benchmark_bwd_intra_uniform():
     )
     print("─" * 100)
 
-    for T in T_vals:
-        total_len = B * T
-        seq_lens = [T] * B
+    all_configs = [(B, T) for T in T_vals] + [(1, T) for T in T_vals_b1]
+    for b, T in all_configs:
+        total_len = b * T
+        seq_lens = [T] * b
         cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
 
         data = prepare_bwd_intra_inputs(total_len, H, D, device, cu_seqlens, chunk_size)
@@ -170,10 +172,14 @@ def benchmark_bwd_intra_uniform():
         speedup = ms_fla / ms_cula if ms_cula > 0 else float("inf")
 
         print(
-            f"{B:>4} {T:>7} │ "
+            f"{b:>4} {T:>7} │ "
             f"{stats['dq'][0]:>10.6f} {stats['dk'][0]:>10.6f} {stats['db'][0]:>10.6f} {stats['dg'][0]:>10.6f}"
             f" │ {ms_fla:>9.4f} {ms_cula:>9.4f} {speedup:>7.2f}x"
         )
+
+        # Free large tensors between sizes
+        del data
+        torch.cuda.synchronize()
 
     print("─" * 100)
 
@@ -184,7 +190,7 @@ def benchmark_bwd_intra_uniform():
 def benchmark_bwd_intra_varlen():
     device = torch.device("cuda")
     chunk_size = BT
-    total_len_vals = [8192, 16384, 32768, 65536]
+    total_len_vals = [8192, 16384, 32768, 65536, 131072]
 
     print()
     print("=" * 110)
@@ -219,12 +225,30 @@ def benchmark_bwd_intra_varlen():
             f" │ {ms_fla:>9.4f} {ms_cula:>9.4f} {speedup:>7.2f}x"
         )
 
+        del data
+        torch.cuda.synchronize()
+
     print("─" * 110)
 
 
 if __name__ == "__main__":
+    import subprocess, sys
     parser = argparse.ArgumentParser(description="bench_kda_bwd_intra: cuLA vs FLA Triton for chunk_kda_bwd_intra")
+    parser.add_argument("--section", choices=["uniform", "varlen"], default=None,
+                        help="Run only one section (used internally for subprocess isolation)")
     args = parser.parse_args()
 
-    benchmark_bwd_intra_uniform()
-    benchmark_bwd_intra_varlen()
+    if args.section == "uniform":
+        benchmark_bwd_intra_uniform()
+    elif args.section == "varlen":
+        benchmark_bwd_intra_varlen()
+    else:
+        # Run each section in a separate process to avoid CUDA error state leaking
+        for section in ["uniform", "varlen"]:
+            ret = subprocess.run(
+                [sys.executable, __file__, "--section", section],
+                stdout=sys.stdout, stderr=sys.stderr,
+            )
+            if ret.returncode != 0:
+                print(f"\n[WARNING] {section} benchmark exited with code {ret.returncode}")
+            print()

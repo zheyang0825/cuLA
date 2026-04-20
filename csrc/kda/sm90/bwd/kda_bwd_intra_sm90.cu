@@ -122,6 +122,60 @@ gemm_m16n32k16(const float* s_A, const float* s_Bop, float acc[4], int tid) {
 }
 
 // ============================================================
+// Fused dual-GEMM with shared B:
+//   acc1 += A1 @ B^T,  acc2 += A2 @ B^T
+// B operand S2R load done once per k-step, saving half B bandwidth.
+// ============================================================
+__device__ __forceinline__ void
+gemm_m16n32k16_shared_b(
+    const float* s_A1, const float* s_A2,
+    const float* s_Bop,
+    float acc1[4], float acc2[4], int tid)
+{
+    TiledMMA_t tiled_mma;
+    auto thr_mma = tiled_mma.get_slice(tid);
+
+    auto sB = make_tensor(make_smem_ptr(s_Bop), SmemLayoutB_op{});
+    auto sA1 = make_tensor(make_smem_ptr(s_A1), SmemLayoutDA{});
+    auto sA2 = make_tensor(make_smem_ptr(s_A2), SmemLayoutDA{});
+
+    auto tCrB  = thr_mma.partition_fragment_B(sB);
+    auto tCrA1 = thr_mma.partition_fragment_A(sA1);
+    auto tCrA2 = thr_mma.partition_fragment_A(sA2);
+
+    auto sC_dummy = make_tensor(make_smem_ptr(s_A1), SmemLayoutAcc{});
+    auto tCrC1 = thr_mma.partition_fragment_C(sC_dummy);
+    auto tCrC2 = thr_mma.partition_fragment_C(sC_dummy);
+
+    CUTE_UNROLL
+    for (int i = 0; i < size(tCrC1); ++i) { tCrC1(i) = acc1[i]; tCrC2(i) = acc2[i]; }
+
+    auto s2r_copy_a = make_tiled_copy_A(S2RAtom{}, tiled_mma);
+    auto s2r_copy_b = make_tiled_copy_B(S2RAtom{}, tiled_mma);
+    auto thr_s2r_a = s2r_copy_a.get_slice(tid);
+    auto thr_s2r_b = s2r_copy_b.get_slice(tid);
+
+    auto tXsB  = thr_s2r_b.partition_S(sB);
+    auto tXrB  = thr_s2r_b.retile_D(tCrB);
+    auto tXsA1 = thr_s2r_a.partition_S(sA1);
+    auto tXrA1 = thr_s2r_a.retile_D(tCrA1);
+    auto tXsA2 = thr_s2r_a.partition_S(sA2);
+    auto tXrA2 = thr_s2r_a.retile_D(tCrA2);
+
+    CUTE_UNROLL
+    for (int k = 0; k < size<2>(tCrA1); ++k) {
+        copy(s2r_copy_b, tXsB(_, _, k), tXrB(_, _, k));   // B loaded once
+        copy(s2r_copy_a, tXsA1(_, _, k), tXrA1(_, _, k));
+        gemm(tiled_mma, tCrA1(_, _, k), tCrB(_, _, k), tCrC1);
+        copy(s2r_copy_a, tXsA2(_, _, k), tXrA2(_, _, k));
+        gemm(tiled_mma, tCrA2(_, _, k), tCrB(_, _, k), tCrC2);
+    }
+
+    CUTE_UNROLL
+    for (int i = 0; i < size(tCrC1); ++i) { acc1[i] = tCrC1(i); acc2[i] = tCrC2(i); }
+}
+
+// ============================================================
 // Per-thread accumulator → (row, col) mapping
 // SM80_16x8x8 CLayout = SM80_16x8_Row (column-major in MxN tile):
 //   pos = m + n * 16 (NOT row-major m * 8 + n)
@@ -343,8 +397,7 @@ __launch_bounds__(NUM_THREADS) kda_bwd_intra_kernel_sm90(__grid_constant__ const
             asm volatile("cp.async.wait_group 0;\n");
             __syncthreads();
 
-            gemm_m16n32k16(smem.s_dA_qk.data(), smem.s_KG.data(), dq2_acc, tid);
-            gemm_m16n32k16(smem.s_dA_kk.data(), smem.s_KG.data(), dk2_acc, tid);
+            gemm_m16n32k16_shared_b(smem.s_dA_qk.data(), smem.s_dA_kk.data(), smem.s_KG.data(), dq2_acc, dk2_acc, tid);
             __syncthreads();
         }
 
@@ -423,8 +476,7 @@ __launch_bounds__(NUM_THREADS) kda_bwd_intra_kernel_sm90(__grid_constant__ const
 
         float tmp_dq[4] = {0.f, 0.f, 0.f, 0.f};
         float tmp_dk[4] = {0.f, 0.f, 0.f, 0.f};
-        gemm_m16n32k16(smem.s_dA_qk.data(), smem.s_KG.data(), tmp_dq, tid);
-        gemm_m16n32k16(smem.s_dA_kk.data(), smem.s_KG.data(), tmp_dk, tid);
+        gemm_m16n32k16_shared_b(smem.s_dA_qk.data(), smem.s_dA_kk.data(), smem.s_KG.data(), tmp_dq, tmp_dk, tid);
 
         for (int v = 0; v < 4; ++v) {
             int row, col;
@@ -528,13 +580,13 @@ __launch_bounds__(NUM_THREADS) kda_bwd_intra_kernel_sm90(__grid_constant__ const
             int j_tile = i_t * NC + i_j;
             int j_ti = i_t * BT + i_j * BC;
 
-            // Cooperative transposed loads: sDA(r,c) = gDA[j_row+c, i_col+r]
+            // Coalesced transposed loads: read dA row-major, transpose on smem write
             for (int idx = tid; idx < BC * BC; idx += NUM_THREADS) {
-                int r = idx / BC, c = idx % BC;
-                bool valid = (j_ti + c) < T_seq;
-                int gmem_addr = (bos + j_ti + c) * (H * BT) + i_h * BT + i_i * BC + r;
-                sDAqk(r, c) = valid ? dAqk_ptr[gmem_addr] : 0.f;
-                sDAkk(r, c) = valid ? dAkk_ptr[gmem_addr] : 0.f;
+                int r = idx / BC, c = idx % BC;  // r=j-row, c=i-col (contiguous in gmem)
+                bool valid = (j_ti + r) < T_seq;
+                int gmem_addr = (bos + j_ti + r) * (H * BT) + i_h * BT + i_i * BC + c;
+                sDAqk(c, r) = valid ? dAqk_ptr[gmem_addr] : 0.f;
+                sDAkk(c, r) = valid ? dAkk_ptr[gmem_addr] : 0.f;
             }
 
             // Build QG = q_j * exp2(g_j - gn) and KBG = k_j * beta_j * exp2(g_j - gn)
@@ -581,13 +633,13 @@ __launch_bounds__(NUM_THREADS) kda_bwd_intra_kernel_sm90(__grid_constant__ const
         }
         __syncthreads();
 
-        // Cooperative transposed loads with upper-tri mask (r <= c)
+        // Coalesced transposed loads with upper-tri mask
         for (int idx = tid; idx < BC * BC; idx += NUM_THREADS) {
-            int r = idx / BC, c = idx % BC;
-            bool mask = (r <= c) && (i_ti + r < T_seq) && (i_ti + c < T_seq);
-            int gmem_addr = (bos + i_ti + c) * (H * BT) + i_h * BT + i_i * BC + r;
-            sDAqk(r, c) = mask ? dAqk_ptr[gmem_addr] : 0.f;
-            sDAkk(r, c) = mask ? dAkk_ptr[gmem_addr] : 0.f;
+            int r = idx / BC, c = idx % BC;  // r=j-row, c=i-col (contiguous in gmem)
+            bool mask = (c <= r) && (i_ti + r < T_seq) && (i_ti + c < T_seq);
+            int gmem_addr = (bos + i_ti + r) * (H * BT) + i_h * BT + i_i * BC + c;
+            sDAqk(c, r) = mask ? dAqk_ptr[gmem_addr] : 0.f;
+            sDAkk(c, r) = mask ? dAkk_ptr[gmem_addr] : 0.f;
         }
 
         // Build Q_exp = q * exp2(g - gn), KB_exp = k * beta * exp2(g - gn) from persistent smem
