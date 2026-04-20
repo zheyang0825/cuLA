@@ -50,8 +50,11 @@ using SmemLayoutB_op = Layout<Shape<Int<BK>, Int<BC>>, Stride<Int<BC + 1>, _1>>;
 // [16,32] fp32, row_bytes=128B → Swizzle<3,2,3> (128B mode)
 using SmemLayoutAcc = decltype(composition(Swizzle<3, 2, 3>{}, Layout<Shape<Int<BC>, Int<BK>>, Stride<Int<BK>, _1>>{}));
 
-// S2R atom for MMA operand loads
-using S2RAtom = Copy_Atom<UniversalCopy<float>, float>;
+// S2R atoms for MMA operand loads
+// A (dA): ldmatrix.x4 — 1 warp instruction loads [16,8] floats (4 regs/thread)
+using S2RAtomA = Copy_Atom<SM75_U32x4_LDSM_N, float>;
+// B (KG): scalar shared load — stride-17 padding gives 0 bank conflicts
+using S2RAtomB = Copy_Atom<UniversalCopy<float>, float>;
 
 // ============================================================
 // Shared memory
@@ -95,9 +98,8 @@ gemm_m16n32k16(const float* s_A, const float* s_Bop, float acc[4], int tid) {
         tCrC(i) = acc[i];
     }
 
-    // S2R copies
-    auto s2r_copy_a = make_tiled_copy_A(S2RAtom{}, tiled_mma);
-    auto s2r_copy_b = make_tiled_copy_B(S2RAtom{}, tiled_mma);
+    auto s2r_copy_a = make_tiled_copy_A(S2RAtomA{}, tiled_mma);
+    auto s2r_copy_b = make_tiled_copy_B(S2RAtomB{}, tiled_mma);
     auto thr_s2r_a = s2r_copy_a.get_slice(tid);
     auto thr_s2r_b = s2r_copy_b.get_slice(tid);
 
@@ -150,8 +152,8 @@ gemm_m16n32k16_shared_b(
     CUTE_UNROLL
     for (int i = 0; i < size(tCrC1); ++i) { tCrC1(i) = acc1[i]; tCrC2(i) = acc2[i]; }
 
-    auto s2r_copy_a = make_tiled_copy_A(S2RAtom{}, tiled_mma);
-    auto s2r_copy_b = make_tiled_copy_B(S2RAtom{}, tiled_mma);
+    auto s2r_copy_a = make_tiled_copy_A(S2RAtomA{}, tiled_mma);
+    auto s2r_copy_b = make_tiled_copy_B(S2RAtomB{}, tiled_mma);
     auto thr_s2r_a = s2r_copy_a.get_slice(tid);
     auto thr_s2r_b = s2r_copy_b.get_slice(tid);
 
@@ -349,6 +351,7 @@ __launch_bounds__(NUM_THREADS) kda_bwd_intra_kernel_sm90(__grid_constant__ const
         }
         __syncthreads();
 
+        #pragma unroll 1
         for (int i_j = 0; i_j < i_i; ++i_j) {
             int j_tile = i_t * NC + i_j;
 
@@ -547,12 +550,18 @@ __launch_bounds__(NUM_THREADS) kda_bwd_intra_kernel_sm90(__grid_constant__ const
         }
         __syncthreads();
 
-        // Coalesced store to gmem as bf16
-        for (int idx = tid; idx < BC * BK; idx += NUM_THREADS) {
-            int r = idx / BK;
-            int c = idx % BK;
+        // Vectorized store to gmem as bf16x4 (64-bit)
+        {
+            int vi = tid;
+            int r = (vi * 4) / BK;
+            int c = (vi * 4) % BK;
             if ((i_ti + r) < T_seq) {
-                gDqOut_tile(r, c) = __float2bfloat16(sStage(r, c));
+                __nv_bfloat162 lo = __floats2bfloat162_rn(sStage(r, c + 0), sStage(r, c + 1));
+                __nv_bfloat162 hi = __floats2bfloat162_rn(sStage(r, c + 2), sStage(r, c + 3));
+                uint2 packed;
+                packed.x = reinterpret_cast<uint32_t&>(lo);
+                packed.y = reinterpret_cast<uint32_t&>(hi);
+                *reinterpret_cast<uint2*>(&gDqOut_tile(r, c)) = packed;
             }
         }
         if (tid < BC && (i_ti + tid) < T_seq) {
@@ -576,6 +585,7 @@ __launch_bounds__(NUM_THREADS) kda_bwd_intra_kernel_sm90(__grid_constant__ const
         }
         __syncthreads();
 
+        #pragma unroll 1
         for (int i_j = i_i + 1; i_j < NC_eff; ++i_j) {
             int j_tile = i_t * NC + i_j;
             int j_ti = i_t * BT + i_j * BC;
@@ -680,7 +690,7 @@ __launch_bounds__(NUM_THREADS) kda_bwd_intra_kernel_sm90(__grid_constant__ const
         auto gDgOut_tile = local_tile(mDgOut, tile_hk, make_coord(tile_row, i_k));
         auto sStage = make_tensor(make_smem_ptr(smem.s_acc.data()), SmemLayoutAcc{});
 
-        // ── dg_out: scatter compute to smem, coalesced store fp32 ──
+        // ── dg_out: scatter compute to smem, vectorized float4 store ──
         for (int v = 0; v < 4; ++v) {
             int row, col;
             get_acc_row_col(tid, v, row, col);
@@ -691,16 +701,24 @@ __launch_bounds__(NUM_THREADS) kda_bwd_intra_kernel_sm90(__grid_constant__ const
         }
         __syncthreads();
 
-        for (int idx = tid; idx < BC * BK; idx += NUM_THREADS) {
-            int r = idx / BK;
-            int c = idx % BK;
+        // BC*BK/4 = 128 = NUM_THREADS → 1 float4 store per thread
+        {
+            constexpr int VEC_ELEMS = BC * BK / 4;  // 128
+            int vi = tid;
+            int r = (vi * 4) / BK;
+            int c = (vi * 4) % BK;
             if ((i_ti + r) < T_seq) {
-                gDgOut_tile(r, c) = sStage(r, c);
+                float4 val;
+                val.x = sStage(r, c + 0);
+                val.y = sStage(r, c + 1);
+                val.z = sStage(r, c + 2);
+                val.w = sStage(r, c + 3);
+                *reinterpret_cast<float4*>(&gDgOut_tile(r, c)) = val;
             }
         }
         __syncthreads();
 
-        // ── dk_out: scatter compute to smem, coalesced store bf16 ──
+        // ── dk_out: scatter compute to smem, vectorized bf16x4 store ──
         for (int v = 0; v < 4; ++v) {
             int row, col;
             get_acc_row_col(tid, v, row, col);
@@ -709,11 +727,19 @@ __launch_bounds__(NUM_THREADS) kda_bwd_intra_kernel_sm90(__grid_constant__ const
         }
         __syncthreads();
 
-        for (int idx = tid; idx < BC * BK; idx += NUM_THREADS) {
-            int r = idx / BK;
-            int c = idx % BK;
+        // BC*BK/8 = 64, 128 threads → 2 threads per chunk, half idle
+        // Use 4-wide bf16 stores (64-bit): BC*BK/4 = 128 = NUM_THREADS
+        {
+            int vi = tid;
+            int r = (vi * 4) / BK;
+            int c = (vi * 4) % BK;
             if ((i_ti + r) < T_seq) {
-                gDkOut_tile(r, c) = __float2bfloat16(sStage(r, c));
+                __nv_bfloat162 lo = __floats2bfloat162_rn(sStage(r, c + 0), sStage(r, c + 1));
+                __nv_bfloat162 hi = __floats2bfloat162_rn(sStage(r, c + 2), sStage(r, c + 3));
+                uint2 packed;
+                packed.x = reinterpret_cast<uint32_t&>(lo);
+                packed.y = reinterpret_cast<uint32_t&>(hi);
+                *reinterpret_cast<uint2*>(&gDkOut_tile(r, c)) = packed;
             }
         }
     }
