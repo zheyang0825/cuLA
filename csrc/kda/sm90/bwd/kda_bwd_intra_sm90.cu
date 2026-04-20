@@ -34,6 +34,30 @@ static constexpr int NUM_THREADS = 128;
 // CuTe type aliases
 // ============================================================
 
+// ============================================================
+// TMA params struct — holds full CuTe TMA copy types
+// ============================================================
+template <typename ShapeQKG, typename ShapeDA,
+          typename TMA_Q, typename TMA_K, typename TMA_G,
+          typename TMA_DAqk, typename TMA_DAkk>
+struct TmaParams {
+    ShapeQKG shape_qkg;
+    ShapeDA  shape_da;
+    TMA_Q    tma_q;
+    TMA_K    tma_k;
+    TMA_G    tma_g;
+    TMA_DAqk tma_dAqk;
+    TMA_DAkk tma_dAkk;
+};
+
+// Idiomatic CuTe TMA load: tiled gmem coordinate tensor → swizzled smem
+template <typename TMA, typename GmemTensor, typename SmemTensor>
+__forceinline__ __device__ void
+launch_tma_copy(const TMA& tma, GmemTensor const& src, SmemTensor& dst, uint64_t& bar) {
+    auto thr_tma = tma.get_slice(_0{});
+    cute::copy(tma.with(bar), thr_tma.partition_S(src), thr_tma.partition_D(dst));
+}
+
 // SM80 TF32 MMA: 16x8x8, TN layout. Tiled across 4 warps in N.
 using MMA_Atom_TF32 = MMA_Atom<SM80_16x8x8_F32TF32TF32F32_TN>;
 using TiledMMA_t = TiledMMA<MMA_Atom_TF32, Layout<Shape<_1, _4, _1>>>;
@@ -144,14 +168,17 @@ get_acc_row_col(int tid, int v, int& row, int& col) {
 // ============================================================
 // Main kernel
 // ============================================================
+template <typename TmaParams_t>
 __global__ void
-__launch_bounds__(NUM_THREADS, 8) kda_bwd_intra_kernel_sm90(__grid_constant__ const KDA_bwd_intra_params params) {
+__launch_bounds__(NUM_THREADS, 8) kda_bwd_intra_kernel_sm90(
+    __grid_constant__ const KDA_bwd_intra_params params,
+    __grid_constant__ const TmaParams_t tma_params) {
     extern __shared__ char smem_buf[];
     SmemStorage& smem = *reinterpret_cast<SmemStorage*>(smem_buf);
 
     // Init TMA mbarrier (1 arrival = elected thread)
     if (threadIdx.x == 0) {
-        cutlass::arch::ClusterBarrier::init(&smem.tma_mbar, 1);
+        cute::initialize_barrier(smem.tma_mbar, 1);
     }
     __syncthreads();
 
@@ -233,28 +260,35 @@ __launch_bounds__(NUM_THREADS, 8) kda_bwd_intra_kernel_sm90(__grid_constant__ co
     // Whether this tile touches the sequence boundary (last few rows may be OOB)
     const bool is_boundary = (i_ti + BC) > T_seq;
 
-    // Prefetch TMA descriptors into TMA cache (thread 0 only — block-wide single issuer)
     if (threadIdx.x == 0) {
-        cute::prefetch_tma_descriptor(&params.tma_q);
-        cute::prefetch_tma_descriptor(&params.tma_k);
-        cute::prefetch_tma_descriptor(&params.tma_g);
-        cute::prefetch_tma_descriptor(&params.tma_dAqk);
-        cute::prefetch_tma_descriptor(&params.tma_dAkk);
+        cute::prefetch_tma_descriptor(tma_params.tma_q.get_tma_descriptor());
+        cute::prefetch_tma_descriptor(tma_params.tma_k.get_tma_descriptor());
+        cute::prefetch_tma_descriptor(tma_params.tma_g.get_tma_descriptor());
+        cute::prefetch_tma_descriptor(tma_params.tma_dAqk.get_tma_descriptor());
+        cute::prefetch_tma_descriptor(tma_params.tma_dAkk.get_tma_descriptor());
     }
+
+    // TMA coordinate tensors: domain-offset to batch start, select head → 2D (seq, dim)
+    auto mQ_tma    = domain_offset(make_coord(bos, _0{}, _0{}), tma_params.tma_q.get_tma_tensor(tma_params.shape_qkg))(_, _, i_h);
+    auto mK_tma    = domain_offset(make_coord(bos, _0{}, _0{}), tma_params.tma_k.get_tma_tensor(tma_params.shape_qkg))(_, _, i_h);
+    auto mG_tma    = domain_offset(make_coord(bos, _0{}, _0{}), tma_params.tma_g.get_tma_tensor(tma_params.shape_qkg))(_, _, i_h);
+    auto mDAqk_tma = domain_offset(make_coord(bos, _0{}, _0{}), tma_params.tma_dAqk.get_tma_tensor(tma_params.shape_da))(_, _, i_h);
+    auto mDAkk_tma = domain_offset(make_coord(bos, _0{}, _0{}), tma_params.tma_dAkk.get_tma_tensor(tma_params.shape_da))(_, _, i_h);
 
     // ── Load persistent tiles via TMA: Q, K, G + cooperative beta ──
     int tma_phase = 0;
     {
-        const int crd0_qkg = i_h * K + i_k * BK;                                   // inner dim (col in 2D tensor)
-        const int crd1_qkg = bos + i_ti;                                           // outer dim (row in 2D tensor)
+        auto gQ = local_tile(mQ_tma, make_shape(Int<BC>{}, Int<BK>{}), make_coord(tile_row, i_k));
+        auto gK = local_tile(mK_tma, make_shape(Int<BC>{}, Int<BK>{}), make_coord(tile_row, i_k));
+        auto gG = local_tile(mG_tma, make_shape(Int<BC>{}, Int<BK>{}), make_coord(tile_row, i_k));
         constexpr int PERSISTENT_BYTES = BC * BK * int(sizeof(__nv_bfloat16)) * 2  // Q + K
                                          + BC * BK * int(sizeof(float));           // G
 
         if (threadIdx.x == 0) {
-            cutlass::arch::ClusterTransactionBarrier::arrive_and_expect_tx(&smem.tma_mbar, PERSISTENT_BYTES);
-            SM90_TMA_LOAD_2D::copy(&params.tma_q, &smem.tma_mbar, 0UL, smem.s_q.data(), crd0_qkg, crd1_qkg);
-            SM90_TMA_LOAD_2D::copy(&params.tma_k, &smem.tma_mbar, 0UL, smem.s_k.data(), crd0_qkg, crd1_qkg);
-            SM90_TMA_LOAD_2D::copy(&params.tma_g, &smem.tma_mbar, 0UL, smem.s_g.data(), crd0_qkg, crd1_qkg);
+            cute::set_barrier_transaction_bytes(smem.tma_mbar, PERSISTENT_BYTES);
+            launch_tma_copy(tma_params.tma_q, gQ, sQ, smem.tma_mbar);
+            launch_tma_copy(tma_params.tma_k, gK, sK, smem.tma_mbar);
+            launch_tma_copy(tma_params.tma_g, gG, sG, smem.tma_mbar);
         }
 
         // Beta: cooperative scalar loads (overlap with TMA in-flight)
@@ -265,8 +299,7 @@ __launch_bounds__(NUM_THREADS, 8) kda_bwd_intra_kernel_sm90(__grid_constant__ co
             }
         }
 
-        // Wait for TMA completion
-        cutlass::arch::ClusterBarrier::wait(&smem.tma_mbar, tma_phase);
+        cute::wait_barrier(smem.tma_mbar, tma_phase);
         tma_phase ^= 1;
 
         // Zero OOB rows (TMA may load next-sequence data for mid-sequence boundaries)
@@ -301,16 +334,14 @@ __launch_bounds__(NUM_THREADS, 8) kda_bwd_intra_kernel_sm90(__grid_constant__ co
 
             // TMA load dAqk + dAkk: fp32 [16,16] each
             {
-                const int crd0_da = i_h * BT + i_j * BC;
-                const int crd1_da = bos + i_ti;
+                auto gDAqk = local_tile(mDAqk_tma, make_shape(Int<BC>{}, Int<BC>{}), make_coord(tile_row, i_j));
+                auto gDAkk = local_tile(mDAkk_tma, make_shape(Int<BC>{}, Int<BC>{}), make_coord(tile_row, i_j));
                 constexpr int DA_BYTES = BC * BC * int(sizeof(float)) * 2;  // 2048
 
                 if (threadIdx.x == 0) {
-                    cutlass::arch::ClusterTransactionBarrier::arrive_and_expect_tx(&smem.tma_mbar, DA_BYTES);
-                    SM90_TMA_LOAD_2D::copy(
-                        &params.tma_dAqk, &smem.tma_mbar, 0UL, smem.s_dA_qk.data(), crd0_da, crd1_da);
-                    SM90_TMA_LOAD_2D::copy(
-                        &params.tma_dAkk, &smem.tma_mbar, 0UL, smem.s_dA_kk.data(), crd0_da, crd1_da);
+                    cute::set_barrier_transaction_bytes(smem.tma_mbar, DA_BYTES);
+                    launch_tma_copy(tma_params.tma_dAqk, gDAqk, sDAqk, smem.tma_mbar);
+                    launch_tma_copy(tma_params.tma_dAkk, gDAkk, sDAkk, smem.tma_mbar);
                 }
             }
 
@@ -328,7 +359,7 @@ __launch_bounds__(NUM_THREADS, 8) kda_bwd_intra_kernel_sm90(__grid_constant__ co
             }
 
             // Wait for TMA dA + fence KG writes
-            cutlass::arch::ClusterBarrier::wait(&smem.tma_mbar, tma_phase);
+            cute::wait_barrier(smem.tma_mbar, tma_phase);
             tma_phase ^= 1;
 
             if (is_boundary) {
@@ -360,7 +391,6 @@ __launch_bounds__(NUM_THREADS, 8) kda_bwd_intra_kernel_sm90(__grid_constant__ co
     // ════════════════════════════════════════════════════════════════════════
     // PHASE 1 Diagonal (j == i_i, lower-triangular): dQ, dK
     // ════════════════════════════════════════════════════════════════════════
-    __syncthreads();
     {
         int mid = min(BC / 2, T_seq - i_ti - 1);
         if (tid < BK) {
@@ -370,14 +400,14 @@ __launch_bounds__(NUM_THREADS, 8) kda_bwd_intra_kernel_sm90(__grid_constant__ co
 
         // TMA load dAqk + dAkk diagonal tile
         {
-            const int crd0_da = i_h * BT + i_i * BC;
-            const int crd1_da = bos + i_ti;
+            auto gDAqk = local_tile(mDAqk_tma, make_shape(Int<BC>{}, Int<BC>{}), make_coord(tile_row, i_i));
+            auto gDAkk = local_tile(mDAkk_tma, make_shape(Int<BC>{}, Int<BC>{}), make_coord(tile_row, i_i));
             constexpr int DA_BYTES = BC * BC * int(sizeof(float)) * 2;  // 2048
 
             if (threadIdx.x == 0) {
-                cutlass::arch::ClusterTransactionBarrier::arrive_and_expect_tx(&smem.tma_mbar, DA_BYTES);
-                SM90_TMA_LOAD_2D::copy(&params.tma_dAqk, &smem.tma_mbar, 0UL, smem.s_dA_qk.data(), crd0_da, crd1_da);
-                SM90_TMA_LOAD_2D::copy(&params.tma_dAkk, &smem.tma_mbar, 0UL, smem.s_dA_kk.data(), crd0_da, crd1_da);
+                cute::set_barrier_transaction_bytes(smem.tma_mbar, DA_BYTES);
+                launch_tma_copy(tma_params.tma_dAqk, gDAqk, sDAqk, smem.tma_mbar);
+                launch_tma_copy(tma_params.tma_dAkk, gDAkk, sDAkk, smem.tma_mbar);
             }
         }
 
@@ -391,9 +421,8 @@ __launch_bounds__(NUM_THREADS, 8) kda_bwd_intra_kernel_sm90(__grid_constant__ co
         }
 
         // Wait for TMA dA + fence KG writes
-        cutlass::arch::ClusterBarrier::wait(&smem.tma_mbar, tma_phase);
+        cute::wait_barrier(smem.tma_mbar, tma_phase);
         tma_phase ^= 1;
-        __syncthreads();
 
         // Apply lower-triangular mask to both dAqk and dAkk
         for (int idx = tid; idx < BC * BC; idx += NUM_THREADS) {
@@ -557,7 +586,6 @@ __launch_bounds__(NUM_THREADS, 8) kda_bwd_intra_kernel_sm90(__grid_constant__ co
     }
 
     // ── Phase 2 diagonal (j == i_i, upper-triangular) ──
-    __syncthreads();
     {
         int mid = min(BC / 2, T_seq - i_ti - 1);
         if (tid < BK) {
@@ -662,60 +690,53 @@ run_kda_bwd_intra_sm90(KDA_bwd_intra_params& params, cudaStream_t stream) {
     const int K = params.d;
     const int total = params.total_q_len;
 
-    // ── Create TMA descriptors (2D: [total_len, H*D], stride [H*D, 1]) ──
-    {
-        // Q, K: bf16 [total_len, H*K]
-        auto shape_qk = make_shape(total, H * K);
-        auto stride_qk = make_stride(H * K, _1{});
+    // ── 3D gmem tensors: [total_len, dim, H] with stride [H*dim, 1, dim] ──
+    // QKG: inner dim = K
+    auto shape_qkg  = make_shape(total, K, H);
+    auto stride_qkg = make_stride(H * K, _1{}, K);
 
-        auto tma_q = cute::make_tma_copy(
-            cute::SM90_TMA_LOAD{},
-            make_tensor(
-                make_gmem_ptr(reinterpret_cast<const cutlass::bfloat16_t*>(params.q_ptr)),
-                make_layout(shape_qk, stride_qk)),
-            SmemLayoutQK{});
-        params.tma_q = *reinterpret_cast<const cute::TmaDescriptor*>(tma_q.get_tma_descriptor());
+    auto gmem_q = make_tensor(make_gmem_ptr(reinterpret_cast<const cutlass::bfloat16_t*>(params.q_ptr)),
+                              make_layout(shape_qkg, stride_qkg));
+    auto gmem_k = make_tensor(make_gmem_ptr(reinterpret_cast<const cutlass::bfloat16_t*>(params.k_ptr)),
+                              make_layout(shape_qkg, stride_qkg));
+    auto gmem_g = make_tensor(make_gmem_ptr(reinterpret_cast<const float*>(params.g_ptr)),
+                              make_layout(shape_qkg, stride_qkg));
 
-        auto tma_k = cute::make_tma_copy(
-            cute::SM90_TMA_LOAD{},
-            make_tensor(
-                make_gmem_ptr(reinterpret_cast<const cutlass::bfloat16_t*>(params.k_ptr)),
-                make_layout(shape_qk, stride_qk)),
-            SmemLayoutQK{});
-        params.tma_k = *reinterpret_cast<const cute::TmaDescriptor*>(tma_k.get_tma_descriptor());
+    // DA: inner dim = BT
+    auto shape_da  = make_shape(total, BT, H);
+    auto stride_da = make_stride(H * BT, _1{}, BT);
 
-        // G: fp32 [total_len, H*K]
-        auto tma_g = cute::make_tma_copy(
-            cute::SM90_TMA_LOAD{},
-            make_tensor(make_gmem_ptr(reinterpret_cast<const float*>(params.g_ptr)), make_layout(shape_qk, stride_qk)),
-            SmemLayoutG{});
-        params.tma_g = *reinterpret_cast<const cute::TmaDescriptor*>(tma_g.get_tma_descriptor());
+    auto gmem_daqk = make_tensor(make_gmem_ptr(reinterpret_cast<const float*>(params.dAqk_ptr)),
+                                 make_layout(shape_da, stride_da));
+    auto gmem_dakk = make_tensor(make_gmem_ptr(reinterpret_cast<const float*>(params.dAkk_ptr)),
+                                 make_layout(shape_da, stride_da));
 
-        // dAqk, dAkk: fp32 [total_len, H*BT]
-        auto shape_da = make_shape(total, H * BT);
-        auto stride_da = make_stride(H * BT, _1{});
+    // ── Create TMA copy objects ──
+    auto tma_q    = make_tma_copy(SM90_TMA_LOAD{}, gmem_q, SmemLayoutQK{});
+    auto tma_k    = make_tma_copy(SM90_TMA_LOAD{}, gmem_k, SmemLayoutQK{});
+    auto tma_g    = make_tma_copy(SM90_TMA_LOAD{}, gmem_g, SmemLayoutG{});
+    auto tma_daqk = make_tma_copy(SM90_TMA_LOAD{}, gmem_daqk, SmemLayoutDA{});
+    auto tma_dakk = make_tma_copy(SM90_TMA_LOAD{}, gmem_dakk, SmemLayoutDA{});
 
-        auto tma_daqk = cute::make_tma_copy(
-            cute::SM90_TMA_LOAD{},
-            make_tensor(
-                make_gmem_ptr(reinterpret_cast<const float*>(params.dAqk_ptr)), make_layout(shape_da, stride_da)),
-            SmemLayoutDA{});
-        params.tma_dAqk = *reinterpret_cast<const cute::TmaDescriptor*>(tma_daqk.get_tma_descriptor());
-
-        auto tma_dakk = cute::make_tma_copy(
-            cute::SM90_TMA_LOAD{},
-            make_tensor(
-                make_gmem_ptr(reinterpret_cast<const float*>(params.dAkk_ptr)), make_layout(shape_da, stride_da)),
-            SmemLayoutDA{});
-        params.tma_dAkk = *reinterpret_cast<const cute::TmaDescriptor*>(tma_dakk.get_tma_descriptor());
-    }
+    // ── Package into TmaParams ──
+    TmaParams tma_params{
+        shape_qkg, shape_da,
+        tma_q, tma_k, tma_g, tma_daqk, tma_dakk
+    };
+    using TmaParams_t = decltype(tma_params);
 
     // ── Launch kernel ──
+    auto* kernel = &kda_bwd_intra_kernel_sm90<TmaParams_t>;
+
     dim3 grid = NaiveTileScheduler::get_grid_shape(params.tile_scheduler_params);
     dim3 block(NUM_THREADS);
     int smem_size = sizeof(SmemStorage);
 
-    kda_bwd_intra_kernel_sm90<<<grid, block, smem_size, stream>>>(params);
+    if (smem_size > 48 * 1024) {
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+    }
+
+    kernel<<<grid, block, smem_size, stream>>>(params, tma_params);
 }
 
 }  // namespace sm90
