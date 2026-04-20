@@ -222,50 +222,57 @@ __launch_bounds__(NUM_THREADS) kda_bwd_intra_kernel_sm90(__grid_constant__ const
     auto sDAqk = make_tensor(make_smem_ptr(smem.s_dA_qk.data()), SmemLayoutDA{});
     auto sDAkk = make_tensor(make_smem_ptr(smem.s_dA_kk.data()), SmemLayoutDA{});
 
+    // Whether this tile touches the sequence boundary (last few rows may be OOB)
+    const bool is_boundary = (i_ti + BC) > T_seq;
+
     // ── Load persistent tiles via cp.async: Q, K, G + cooperative beta ──
     {
-        // Q: bf16 [16,32] = 512 elems, 16B/chunk = 8 bf16 → 64 chunks
-        {
-            auto gQ_tile = local_tile(mQ, tile_hk, make_coord(tile_row, i_k));
-            constexpr int Q_CHUNKS = (BC * BK) / 8;  // 64
-            for (int ci = tid; ci < Q_CHUNKS; ci += NUM_THREADS) {
+        auto gQ_tile = local_tile(mQ, tile_hk, make_coord(tile_row, i_k));
+        auto gK_tile = local_tile(mK, tile_hk, make_coord(tile_row, i_k));
+        auto gG_tile = local_tile(mG, tile_hk, make_coord(tile_row, i_k));
+        auto gBeta_tile = local_tile(mBeta, Int<BC>{}, tile_row);
+
+        if (is_boundary) {
+            // Slow path: boundary tile — use src_size=0 to zero-fill OOB rows
+            constexpr int BF16_CHUNKS = (BC * BK) / 8;
+            for (int ci = tid; ci < BF16_CHUNKS; ci += NUM_THREADS) {
                 int elem = ci * 8;
-                int r = elem / BK;
-                int c = elem % BK;
-                uint32_t dst = cute::cast_smem_ptr_to_uint(&sQ(r, c));
-                const __nv_bfloat16* src = &gQ_tile(r, c);
-                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"(src));
+                int r = elem / BK, c = elem % BK;
+                int src_size = (i_ti + r >= T_seq) ? 0 : 16;
+                uint32_t dstQ = cute::cast_smem_ptr_to_uint(&sQ(r, c));
+                uint32_t dstK = cute::cast_smem_ptr_to_uint(&sK(r, c));
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dstQ), "l"(&gQ_tile(r, c)), "r"(src_size));
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dstK), "l"(&gK_tile(r, c)), "r"(src_size));
             }
-        }
-        // K: bf16 [16,32] = 512 elems → 64 chunks
-        {
-            auto gK_tile = local_tile(mK, tile_hk, make_coord(tile_row, i_k));
-            constexpr int K_CHUNKS = (BC * BK) / 8;  // 64
-            for (int ci = tid; ci < K_CHUNKS; ci += NUM_THREADS) {
-                int elem = ci * 8;
-                int r = elem / BK;
-                int c = elem % BK;
-                uint32_t dst = cute::cast_smem_ptr_to_uint(&sK(r, c));
-                const __nv_bfloat16* src = &gK_tile(r, c);
-                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"(src));
-            }
-        }
-        // G: fp32 [16,32] = 512 elems, 16B/chunk = 4 fp32 → 128 chunks
-        {
-            auto gG_tile = local_tile(mG, tile_hk, make_coord(tile_row, i_k));
-            constexpr int G_CHUNKS = (BC * BK) / 4;  // 128
-            for (int ci = tid; ci < G_CHUNKS; ci += NUM_THREADS) {
+            constexpr int FP32_CHUNKS = (BC * BK) / 4;
+            for (int ci = tid; ci < FP32_CHUNKS; ci += NUM_THREADS) {
                 int elem = ci * 4;
-                int r = elem / BK;
-                int c = elem % BK;
-                uint32_t dst = cute::cast_smem_ptr_to_uint(&sG(r, c));
-                const float* src = &gG_tile(r, c);
-                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"(src));
+                int r = elem / BK, c = elem % BK;
+                int src_size = (i_ti + r >= T_seq) ? 0 : 16;
+                uint32_t dstG = cute::cast_smem_ptr_to_uint(&sG(r, c));
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dstG), "l"(&gG_tile(r, c)), "r"(src_size));
             }
-        }
-        // Beta: cooperative (scalar per row, not worth cp.async)
-        {
-            auto gBeta_tile = local_tile(mBeta, Int<BC>{}, tile_row);
+            if (tid < BC) {
+                smem.s_beta[tid] = (i_ti + tid < T_seq) ? __bfloat162float(gBeta_tile(tid)) : 0.f;
+            }
+        } else {
+            // Fast path: no boundary — unconditional 3-operand cp.async
+            constexpr int BF16_CHUNKS = (BC * BK) / 8;
+            for (int ci = tid; ci < BF16_CHUNKS; ci += NUM_THREADS) {
+                int elem = ci * 8;
+                int r = elem / BK, c = elem % BK;
+                uint32_t dstQ = cute::cast_smem_ptr_to_uint(&sQ(r, c));
+                uint32_t dstK = cute::cast_smem_ptr_to_uint(&sK(r, c));
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dstQ), "l"(&gQ_tile(r, c)));
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dstK), "l"(&gK_tile(r, c)));
+            }
+            constexpr int FP32_CHUNKS = (BC * BK) / 4;
+            for (int ci = tid; ci < FP32_CHUNKS; ci += NUM_THREADS) {
+                int elem = ci * 4;
+                int r = elem / BK, c = elem % BK;
+                uint32_t dstG = cute::cast_smem_ptr_to_uint(&sG(r, c));
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dstG), "l"(&gG_tile(r, c)));
+            }
             if (tid < BC) {
                 smem.s_beta[tid] = __bfloat162float(gBeta_tile(tid));
             }
@@ -296,20 +303,29 @@ __launch_bounds__(NUM_THREADS) kda_bwd_intra_kernel_sm90(__grid_constant__ const
                 auto gDAqk_j = local_tile(mDAqk_g, tile_da, make_coord(tile_row, i_j));
                 auto gDAkk_j = local_tile(mDAkk_g, tile_da, make_coord(tile_row, i_j));
                 constexpr int DA_CHUNKS = (BC * BC) / 4;  // 64
-                for (int ci = tid; ci < DA_CHUNKS; ci += NUM_THREADS) {
-                    int elem = ci * 4;
-                    int r = elem / BC;
-                    int c = elem % BC;
-                    uint32_t dst_qk = cute::cast_smem_ptr_to_uint(&sDAqk(r, c));
-                    uint32_t dst_kk = cute::cast_smem_ptr_to_uint(&sDAkk(r, c));
-                    const float* src_qk = &gDAqk_j(r, c);
-                    const float* src_kk = &gDAkk_j(r, c);
-                    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst_qk), "l"(src_qk));
-                    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst_kk), "l"(src_kk));
+                if (is_boundary) {
+                    for (int ci = tid; ci < DA_CHUNKS; ci += NUM_THREADS) {
+                        int elem = ci * 4;
+                        int r = elem / BC, c = elem % BC;
+                        uint32_t dst_qk = cute::cast_smem_ptr_to_uint(&sDAqk(r, c));
+                        uint32_t dst_kk = cute::cast_smem_ptr_to_uint(&sDAkk(r, c));
+                        int src_size = (i_ti + r >= T_seq) ? 0 : 16;
+                        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dst_qk), "l"(&gDAqk_j(r, c)), "r"(src_size));
+                        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dst_kk), "l"(&gDAkk_j(r, c)), "r"(src_size));
+                    }
+                } else {
+                    for (int ci = tid; ci < DA_CHUNKS; ci += NUM_THREADS) {
+                        int elem = ci * 4;
+                        int r = elem / BC, c = elem % BC;
+                        uint32_t dst_qk = cute::cast_smem_ptr_to_uint(&sDAqk(r, c));
+                        uint32_t dst_kk = cute::cast_smem_ptr_to_uint(&sDAkk(r, c));
+                        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst_qk), "l"(&gDAqk_j(r, c)));
+                        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst_kk), "l"(&gDAkk_j(r, c)));
+                    }
                 }
             }
 
-            // Build KG operand from gmem (overlaps TMA)
+            // Build KG operand from gmem 
             {
                 auto gK_j = local_tile(mK, tile_hk, make_coord(j_tile, i_k));
                 auto gG_j = local_tile(mG, tile_hk, make_coord(j_tile, i_k));
@@ -358,16 +374,25 @@ __launch_bounds__(NUM_THREADS) kda_bwd_intra_kernel_sm90(__grid_constant__ const
             auto gDAqk_diag = local_tile(mDAqk_g, tile_da, make_coord(tile_row, i_i));
             auto gDAkk_diag = local_tile(mDAkk_g, tile_da, make_coord(tile_row, i_i));
             constexpr int DA_CHUNKS = (BC * BC) / 4;  // 64
-            for (int ci = tid; ci < DA_CHUNKS; ci += NUM_THREADS) {
-                int elem = ci * 4;
-                int r = elem / BC;
-                int c = elem % BC;
-                uint32_t dst_qk = cute::cast_smem_ptr_to_uint(&sDAqk(r, c));
-                uint32_t dst_kk = cute::cast_smem_ptr_to_uint(&sDAkk(r, c));
-                const float* src_qk = &gDAqk_diag(r, c);
-                const float* src_kk = &gDAkk_diag(r, c);
-                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst_qk), "l"(src_qk));
-                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst_kk), "l"(src_kk));
+            if (is_boundary) {
+                for (int ci = tid; ci < DA_CHUNKS; ci += NUM_THREADS) {
+                    int elem = ci * 4;
+                    int r = elem / BC, c = elem % BC;
+                    uint32_t dst_qk = cute::cast_smem_ptr_to_uint(&sDAqk(r, c));
+                    uint32_t dst_kk = cute::cast_smem_ptr_to_uint(&sDAkk(r, c));
+                    int src_size = (i_ti + r >= T_seq) ? 0 : 16;
+                    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dst_qk), "l"(&gDAqk_diag(r, c)), "r"(src_size));
+                    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dst_kk), "l"(&gDAkk_diag(r, c)), "r"(src_size));
+                }
+            } else {
+                for (int ci = tid; ci < DA_CHUNKS; ci += NUM_THREADS) {
+                    int elem = ci * 4;
+                    int r = elem / BC, c = elem % BC;
+                    uint32_t dst_qk = cute::cast_smem_ptr_to_uint(&sDAqk(r, c));
+                    uint32_t dst_kk = cute::cast_smem_ptr_to_uint(&sDAkk(r, c));
+                    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst_qk), "l"(&gDAqk_diag(r, c)));
+                    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst_kk), "l"(&gDAkk_diag(r, c)));
+                }
             }
         }
 
@@ -465,7 +490,8 @@ __launch_bounds__(NUM_THREADS) kda_bwd_intra_kernel_sm90(__grid_constant__ const
         for (int v = 0; v < 4; ++v) {
             int row, col;
             get_acc_row_col(tid, v, row, col);
-            sStage(row, col) = dq2_acc[v] + gDq_tile(row, col);
+            float dq_prev = (!is_boundary || (i_ti + row) < T_seq) ? gDq_tile(row, col) : 0.f;
+            sStage(row, col) = dq2_acc[v] + dq_prev;
         }
         __syncthreads();
 
@@ -541,7 +567,8 @@ __launch_bounds__(NUM_THREADS) kda_bwd_intra_kernel_sm90(__grid_constant__ const
         for (int v = 0; v < 4; ++v) {
             int row, col;
             get_acc_row_col(tid, v, row, col);
-            dkt_acc[v] *= exp2f(smem.s_gn[col] - sG(row, col));
+            float scale = (!is_boundary || (i_ti + row) < T_seq) ? exp2f(smem.s_gn[col] - sG(row, col)) : 0.f;
+            dkt_acc[v] *= scale;
         }
     }
 
@@ -607,7 +634,8 @@ __launch_bounds__(NUM_THREADS) kda_bwd_intra_kernel_sm90(__grid_constant__ const
             get_acc_row_col(tid, v, row, col);
             float qv = __bfloat162float(sQ(row, col));
             float kv = __bfloat162float(sK(row, col));
-            sStage(row, col) = qv * dq2_acc[v] + (dk2_acc[v] - dkt_acc[v]) * kv + gDg_tile(row, col);
+            float dg_prev = (!is_boundary || (i_ti + row) < T_seq) ? gDg_tile(row, col) : 0.f;
+            sStage(row, col) = qv * dq2_acc[v] + (dk2_acc[v] - dkt_acc[v]) * kv + dg_prev;
         }
         __syncthreads();
 
@@ -624,7 +652,8 @@ __launch_bounds__(NUM_THREADS) kda_bwd_intra_kernel_sm90(__grid_constant__ const
         for (int v = 0; v < 4; ++v) {
             int row, col;
             get_acc_row_col(tid, v, row, col);
-            sStage(row, col) = dk2_acc[v] + gDk_tile(row, col) + dkt_acc[v];
+            float dk_prev = (!is_boundary || (i_ti + row) < T_seq) ? gDk_tile(row, col) : 0.f;
+            sStage(row, col) = dk2_acc[v] + dk_prev + dkt_acc[v];
         }
         __syncthreads();
 
