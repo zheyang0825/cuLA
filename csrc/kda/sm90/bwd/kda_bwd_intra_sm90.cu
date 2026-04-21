@@ -604,13 +604,34 @@ __launch_bounds__(NUM_THREADS) kda_bwd_intra_kernel_sm90(__grid_constant__ const
             int j_tile = i_t * NC + i_j;
             int j_ti = i_t * BT + i_j * BC;
 
-            // Coalesced transposed loads: read dA row-major, transpose on smem write
-            for (int idx = tid; idx < BC * BC; idx += NUM_THREADS) {
-                int r = idx / BC, c = idx % BC;  // r=j-row, c=i-col (contiguous in gmem)
+            // Coalesced transposed loads: read dA row-major as float4, transpose on smem write
+            constexpr int DA_VEC_ELEMS = BC * BC / 4;  // 64
+            for (int vi = tid; vi < DA_VEC_ELEMS; vi += NUM_THREADS) {
+                int r = vi / (BC / 4);
+                int c = (vi % (BC / 4)) * 4;
                 bool valid = (j_ti + r) < T_seq;
                 int gmem_addr = (bos + j_ti + r) * (H * BT) + i_h * BT + i_i * BC + c;
-                sDAqk(c, r) = valid ? dAqk_ptr[gmem_addr] : 0.f;
-                sDAkk(c, r) = valid ? dAkk_ptr[gmem_addr] : 0.f;
+                if (valid) {
+                    float4 qv = *reinterpret_cast<const float4*>(dAqk_ptr + gmem_addr);
+                    float4 kv = *reinterpret_cast<const float4*>(dAkk_ptr + gmem_addr);
+                    sDAqk(c + 0, r) = qv.x;
+                    sDAqk(c + 1, r) = qv.y;
+                    sDAqk(c + 2, r) = qv.z;
+                    sDAqk(c + 3, r) = qv.w;
+                    sDAkk(c + 0, r) = kv.x;
+                    sDAkk(c + 1, r) = kv.y;
+                    sDAkk(c + 2, r) = kv.z;
+                    sDAkk(c + 3, r) = kv.w;
+                } else {
+                    sDAqk(c + 0, r) = 0.f;
+                    sDAqk(c + 1, r) = 0.f;
+                    sDAqk(c + 2, r) = 0.f;
+                    sDAqk(c + 3, r) = 0.f;
+                    sDAkk(c + 0, r) = 0.f;
+                    sDAkk(c + 1, r) = 0.f;
+                    sDAkk(c + 2, r) = 0.f;
+                    sDAkk(c + 3, r) = 0.f;
+                }
             }
 
             // Build QG = q_j * exp2(g_j - gn) and KBG = k_j * beta_j * exp2(g_j - gn)
@@ -691,13 +712,33 @@ __launch_bounds__(NUM_THREADS) kda_bwd_intra_kernel_sm90(__grid_constant__ const
         }
         __syncthreads();
 
-        // Coalesced transposed loads with upper-tri mask
-        for (int idx = tid; idx < BC * BC; idx += NUM_THREADS) {
-            int r = idx / BC, c = idx % BC;  // r=j-row, c=i-col (contiguous in gmem)
-            bool mask = (c <= r) && (i_ti + r < T_seq) && (i_ti + c < T_seq);
-            int gmem_addr = (bos + i_ti + r) * (H * BT) + i_h * BT + i_i * BC + c;
-            sDAqk(c, r) = mask ? dAqk_ptr[gmem_addr] : 0.f;
-            sDAkk(c, r) = mask ? dAkk_ptr[gmem_addr] : 0.f;
+        // Coalesced transposed loads with upper-tri mask.
+        // Only vectorize the non-boundary case; boundary needs per-element guards.
+        if (!is_boundary) {
+            constexpr int DA_VEC_ELEMS = BC * BC / 4;  // 64
+            for (int vi = tid; vi < DA_VEC_ELEMS; vi += NUM_THREADS) {
+                int r = vi / (BC / 4);
+                int c = (vi % (BC / 4)) * 4;
+                int gmem_addr = (bos + i_ti + r) * (H * BT) + i_h * BT + i_i * BC + c;
+                float4 qv = *reinterpret_cast<const float4*>(dAqk_ptr + gmem_addr);
+                float4 kv = *reinterpret_cast<const float4*>(dAkk_ptr + gmem_addr);
+                sDAqk(c + 0, r) = (c + 0 <= r) ? qv.x : 0.f;
+                sDAqk(c + 1, r) = (c + 1 <= r) ? qv.y : 0.f;
+                sDAqk(c + 2, r) = (c + 2 <= r) ? qv.z : 0.f;
+                sDAqk(c + 3, r) = (c + 3 <= r) ? qv.w : 0.f;
+                sDAkk(c + 0, r) = (c + 0 <= r) ? kv.x : 0.f;
+                sDAkk(c + 1, r) = (c + 1 <= r) ? kv.y : 0.f;
+                sDAkk(c + 2, r) = (c + 2 <= r) ? kv.z : 0.f;
+                sDAkk(c + 3, r) = (c + 3 <= r) ? kv.w : 0.f;
+            }
+        } else {
+            for (int idx = tid; idx < BC * BC; idx += NUM_THREADS) {
+                int r = idx / BC, c = idx % BC;  // r=j-row, c=i-col (contiguous in gmem)
+                bool mask = (c <= r) && (i_ti + r < T_seq) && (i_ti + c < T_seq);
+                int gmem_addr = (bos + i_ti + r) * (H * BT) + i_h * BT + i_i * BC + c;
+                sDAqk(c, r) = mask ? dAqk_ptr[gmem_addr] : 0.f;
+                sDAkk(c, r) = mask ? dAkk_ptr[gmem_addr] : 0.f;
+            }
         }
 
         // Build Q_exp = q * exp2(g - gn), KB_exp = k * beta * exp2(g - gn) from persistent smem
