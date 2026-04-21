@@ -132,7 +132,7 @@ def run_fla(data):
     return dq, dk, db, dg
 
 
-def test_correctness(label, data, dq_ratio=0.02, dk_ratio=0.02, db_ratio=0.04, dg_ratio=0.04):
+def test_correctness(label, data, dq_ratio=0.008, dk_ratio=0.008, db_ratio=0.02, dg_ratio=0.02):
     """Compare CUDA output vs FLA Triton reference."""
     print(f"\n{'=' * 60}")
     print(f"  {label}")
