@@ -807,12 +807,28 @@ __launch_bounds__(NUM_THREADS) kda_bwd_intra_kernel_sm90(__grid_constant__ const
         }
         __syncthreads();
 
+        // Preload old dk row-major so the hot dk_prev reads avoid accumulator-mapped gmem gathers.
+        {
+            constexpr int VEC_ELEMS = BC * BK / 4;  // 128
+            int vi = tid;
+            int r = (vi * 4) / BK;
+            int c = (vi * 4) % BK;
+            float4 prev = {0.f, 0.f, 0.f, 0.f};
+            if ((i_ti + r) < T_seq) {
+                prev = *reinterpret_cast<const float4*>(&gDk_tile(r, c));
+            }
+            sStage(r, c + 0) = prev.x;
+            sStage(r, c + 1) = prev.y;
+            sStage(r, c + 2) = prev.z;
+            sStage(r, c + 3) = prev.w;
+        }
+        __syncthreads();
+
         // ── dk_out: scatter compute to smem, vectorized bf16x4 store ──
         for (int v = 0; v < 4; ++v) {
             int row, col;
             get_acc_row_col(tid, v, row, col);
-            float dk_prev = (!is_boundary || (i_ti + row) < T_seq) ? gDk_tile(row, col) : 0.f;
-            sStage(row, col) = dk2_acc[v] + dk_prev + dkt_acc[v];
+            sStage(row, col) += dk2_acc[v] + dkt_acc[v];
         }
         __syncthreads();
 
