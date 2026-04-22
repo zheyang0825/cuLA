@@ -47,7 +47,7 @@ def accuracy_stats(a, b):
     denom = b.abs().max().item()
     rel_max = max_diff / denom if denom > 0 else 0.0
     mean_diff = diff.abs().mean().item()
-    return rmse, rel_max, mean_diff
+    return rmse, rel_max, mean_diff 
 
 
 def prepare_bwd_intra_inputs(total_len, H, D, device, cu_seqlens, chunk_size=BT, seed=SEED):
