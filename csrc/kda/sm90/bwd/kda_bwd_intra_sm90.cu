@@ -35,7 +35,7 @@ constexpr int T_TILE = 64;                    // chunk size (tokens per tile)
 constexpr int K_SIZE = 128;                   // head dimension
 constexpr int K_TILE = 32;                    // per-ki tile width
 constexpr int K_ITERATION = K_SIZE / K_TILE;  // = 4
-constexpr int NUM_BUF = 2;                    // double buffer stages
+constexpr int NUM_BUF = 1;                    // single buffer (SMEM-limited)
 constexpr int NUM_MMA_THREADS = 128;
 constexpr int NUM_PREP_THREADS = 256;
 constexpr int NUM_LOAD_THREADS = 32;
@@ -61,6 +61,10 @@ constexpr int REG_PREP = 160;  // Prep: scalar computation
 
 // MMA atom alias
 using MMA_TF32 = cute::SM80_16x8x8_F32TF32TF32F32_TN;
+
+// Single-warp TiledMMA — each MMA warp handles its own 16-row block of the
+// (64, 32) dQ/dQ2/dKt output. We branch on warp_id to select the active block.
+using TiledMMA_BWD = decltype(make_tiled_mma(MMA_TF32{}));
 
 // Helper: reinterpret float as uint32_t for MMA operand
 __forceinline__ __device__ uint32_t
@@ -163,6 +167,9 @@ struct SharedStorage {
     //    DKT exchange (sDKT_0 / sDKT_1).
     array_aligned<float, cosize_v<SmemLayoutInputFP32>> smem_mma_dq;    // dQ (intra) + DKT_0
     array_aligned<float, cosize_v<SmemLayoutInputFP32>> smem_mma_dq2;   // dQ2 (inter) + DKT_1
+    // Upper-half read path: dk_lower = dAkk @ KG (analogue of dq but with dAkk).
+    array_aligned<float, cosize_v<SmemLayoutInputFP32>> smem_mma_dk_lower_intra;
+    array_aligned<float, cosize_v<SmemLayoutInputFP32>> smem_mma_dk_lower_inter;
 
     // ── Per-iteration db reduce scratch (WG0 -> WG1)
     array_aligned<float, T_TILE> db_partial;  // 256 B
@@ -178,6 +185,8 @@ struct SharedStorage {
     // Async pipelines: MMA → Prep (phase-tracked, single-buffered)
     alignas(16) cute::uint64_t bar_mma_dq_done;   // MMA signals: dQ + dQ2 ready
     alignas(16) cute::uint64_t bar_mma_dkt_done;   // MMA signals: dKt ready
+    // Prep → MMA: dQ/dQ2 consumed, safe to overwrite smem_mma_dq for dKt.
+    alignas(16) cute::uint64_t bar_prep_dq_consumed;
 
     // Prep → Load
     alignas(16) cute::uint64_t bar_dA_free[NUM_BUF];
@@ -250,6 +259,9 @@ prep_compute_epilogue_body(
                 [(start_offset + tile_idx * T_TILE + local_idx) * params.h + head_idx];
         }
     }
+
+    // b_phase tracks the phase parity for MMA<->Prep async bars (flips per k_idx).
+    int b_phase = 0;
 
     for (int k_idx = 0; k_idx < K_ITERATION; ++k_idx) {
         int local_phase = (state_phase >> buf_idx_value) & 1;
@@ -397,10 +409,16 @@ prep_compute_epilogue_body(
         }
 #endif
 
-        // ── Read MMA dQ from SMEM (currently zero placeholder) and apply intra scale ──
-        Tensor sMmaDQ = make_tensor(make_smem_ptr(smem->smem_mma_dq.data()),  SmemLayoutInputFP32{});
+        // ── Wait for MMA dQ+dQ2 (+dk_lower) ready, then read and apply intra scale ──
+        cute::wait_barrier(smem->bar_mma_dq_done, b_phase);
+        Tensor sMmaDQ_lo = make_tensor(make_smem_ptr(smem->smem_mma_dq.data()),  SmemLayoutInputFP32{});
+        Tensor sMmaDQ_up = make_tensor(make_smem_ptr(smem->smem_mma_dk_lower_intra.data()), SmemLayoutInputFP32{});
         float res[HALF_K];
-        epilogue_apply_dq_intra_smem<HALF_K, K_OFF>(sMmaDQ, idx_in_warpgroup, res, scale);
+        if (idx_in_warpgroup < 64) {
+            epilogue_apply_dq_intra_smem<HALF_K, K_OFF>(sMmaDQ_lo, idx_in_warpgroup, res, scale);
+        } else {
+            epilogue_apply_dq_intra_smem<HALF_K, K_OFF>(sMmaDQ_up, idx_in_warpgroup, res, scale);
+        }
 
         // ── Compute inter scale directly from sG ──
         {
@@ -418,9 +436,14 @@ prep_compute_epilogue_body(
             }
         }
 
-        // ── Combine dq2 (zero placeholder) ──
-        Tensor sMmaDQ2 = make_tensor(make_smem_ptr(smem->smem_mma_dq2.data()), SmemLayoutInputFP32{});
-        epilogue_combine_dq_inter_smem<HALF_K, K_OFF>(sMmaDQ2, idx_in_warpgroup, res, scale);
+        // ── Combine dq2 / dk_lower_inter ──
+        Tensor sMmaDQ2_lo = make_tensor(make_smem_ptr(smem->smem_mma_dq2.data()),           SmemLayoutInputFP32{});
+        Tensor sMmaDQ2_up = make_tensor(make_smem_ptr(smem->smem_mma_dk_lower_inter.data()), SmemLayoutInputFP32{});
+        if (idx_in_warpgroup < 64) {
+            epilogue_combine_dq_inter_smem<HALF_K, K_OFF>(sMmaDQ2_lo, idx_in_warpgroup, res, scale);
+        } else {
+            epilogue_combine_dq_inter_smem<HALF_K, K_OFF>(sMmaDQ2_up, idx_in_warpgroup, res, scale);
+        }
 
         // ── Output dq / accumulate db ──
         {
@@ -433,7 +456,7 @@ prep_compute_epilogue_body(
                     sK, idx_in_warpgroup, sub_seq_len, res, db, false, db_out_addr, beta_val);
             } else {
                 Tensor sDQ_in = make_tensor(make_smem_ptr(smem->smem_dq_in[buf_idx_value].data()), SmemLayoutInputFP32{});
-                __nv_bfloat16* dq_out_base = (__nv_bfloat16*)(params.dq_out_ptr)
+                float* dq_out_base = (float*)(params.dq_out_ptr)
                     + (start_offset + tile_idx * T_TILE + local_idx) * params.h * K_SIZE
                     + head_idx * K_SIZE + k_idx * K_TILE + K_OFF;
                 epilogue_output_dq<HALF_K, K_OFF>(sQ, sDQ_in, idx_in_warpgroup, sub_seq_len, res, dq_out_base);
@@ -462,10 +485,19 @@ prep_compute_epilogue_body(
         // ── dkt scale (from sG) ──
         epilogue_compute_dkt_scale<HALF_K, K_OFF>(sG, idx_in_warpgroup, sub_seq_len, scale);
 
-        // ── Read MMA dKt from SMEM (zero placeholder) and apply scale ──
-        Tensor sMmaDKt = make_tensor(make_smem_ptr(smem->smem_mma_dq.data()), SmemLayoutInputFP32{});
+        // ── Read MMA dKt from SMEM ──
+        // Intra off-diag dkt lives in smem_mma_dq (lower-half scale exp2(g[next_top]-g[row])).
+        // Inter diag dkt lives in smem_mma_dq2 (upper-half scale exp2(g[mid]-g[row])).
+        cute::arrive_barrier(smem->bar_prep_dq_consumed);
+        cute::wait_barrier(smem->bar_mma_dkt_done, b_phase);
+        Tensor sMmaDKt_intra = make_tensor(make_smem_ptr(smem->smem_mma_dq.data()),  SmemLayoutInputFP32{});
+        Tensor sMmaDKt_inter = make_tensor(make_smem_ptr(smem->smem_mma_dq2.data()), SmemLayoutInputFP32{});
         float res_dkt[HALF_K];
-        epilogue_process_dkt_smem<HALF_K, K_OFF>(sMmaDKt, idx_in_warpgroup, res_dkt, scale, sub_seq_len);
+        if (idx_in_warpgroup < 64) {
+            epilogue_process_dkt_smem<HALF_K, K_OFF>(sMmaDKt_intra, idx_in_warpgroup, res_dkt, scale, sub_seq_len);
+        } else {
+            epilogue_process_dkt_smem<HALF_K, K_OFF>(sMmaDKt_inter, idx_in_warpgroup, res_dkt, scale, sub_seq_len);
+        }
 
         // ── DKT exchange between lower/upper within WG (128-thread named barrier) ──
         NamedBarrier::arrive_and_wait(128, DKT_BAR_ID);
@@ -486,7 +518,7 @@ prep_compute_epilogue_body(
             }
         } else {
             Tensor sDK_in = make_tensor(make_smem_ptr(smem->smem_dk_in[buf_idx_value].data()), SmemLayoutInputFP32{});
-            __nv_bfloat16* dk_out_base = (__nv_bfloat16*)(params.dk_out_ptr)
+            float* dk_out_base = (float*)(params.dk_out_ptr)
                 + (start_offset + tile_idx * T_TILE + local_idx) * params.h * K_SIZE
                 + head_idx * K_SIZE + k_idx * K_TILE + K_OFF;
             epilogue_output_dk<HALF_K, K_OFF>(sDK_in, sDKT_0, idx_in_warpgroup, sub_seq_len, res, res_dkt, dk_out_base);
@@ -496,6 +528,7 @@ prep_compute_epilogue_body(
         cute::arrive_barrier(smem->bar_buf_free[buf_idx_value]);
         state_phase ^= 1 << buf_idx_value;
         buf_idx_value = (buf_idx_value + 1) % NUM_BUF;
+        b_phase ^= 1;
 
         // Lock-step WG0 and WG1 at each k_idx so DB_REDUCE_BAR pairings stay
         // matched across iterations.
@@ -566,7 +599,10 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
         cute::initialize_barrier(smem->bar_kg_all_ready, 256);
         cute::initialize_barrier(smem->bar_qkg_all_ready, 256);
 
-        // Async barriers: MMA → Prep (currently unused; MMA not implemented).
+        // Async barriers: MMA → Prep / Prep → MMA
+        cute::initialize_barrier(smem->bar_mma_dq_done, 128);    // MMA WG arrival
+        cute::initialize_barrier(smem->bar_mma_dkt_done, 128);   // MMA WG arrival
+        cute::initialize_barrier(smem->bar_prep_dq_consumed, 256); // Both Prep WGs
 
         // Prep → Load.  No pre-arrive needed.  Phase semantics:
         // `wait_barrier(bar, P)` blocks while current phase parity == P
@@ -582,18 +618,8 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
 
     __syncthreads();
 
-    // ── Zero-init MMA-result staging buffers (since MMA not implemented).
-    // All 416 threads cooperatively memset to 0 — single-pass.
-    {
-        constexpr int kTotal = cosize_v<SmemLayoutInputFP32>;
-        float* base_dq  = smem->smem_mma_dq.data();
-        float* base_dq2 = smem->smem_mma_dq2.data();
-        for (int i = thread_idx; i < kTotal; i += NUM_THREADS) {
-            base_dq[i]  = 0.0f;
-            base_dq2[i] = 0.0f;
-        }
-        if (thread_idx < T_TILE) smem->db_partial[thread_idx] = 0.0f;
-    }
+    // ── Zero-init db_partial scratch (MMA writes smem_mma_dq/dq2 directly). ──
+    if (thread_idx < T_TILE) smem->db_partial[thread_idx] = 0.0f;
     __syncthreads();
     // state_phase packs the current phase bit of each double-buffered resource:
     // low NUM_BUF bits track value-buffer phases, high NUM_BUF bits track dA/beta phases.
@@ -743,10 +769,299 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
         // MMA warpgroup — mma.sync 4-pass sub-chunk loop
         // =================================================================
     } else if (role == WGRole::MMA) {
-        // cutlass::arch::warpgroup_reg_dealloc<24>();
+        // cutlass::arch::warpgroup_reg_alloc<REG_MMA>();  // optional; enable once stable
+
+        const int warp_id_in_wg = thread_idx / 32;   // 0..3 — selects query-block M=[16*w, 16*(w+1))
+        const int lane_id = thread_idx % 32;
+
+        // Single-warp TiledMMA (atom 16x8x8). Each MMA warp independently computes
+        // a 16-row slice of the (T_TILE=64, K_TILE=32) dQ/dQ2/dKt tile, then R2S
+        // into its own quarter of smem_mma_dq / smem_mma_dq2.
+        TiledMMA_BWD tiled_mma;
+        auto thr_mma = tiled_mma.get_thread_slice(lane_id);
+
+        // ── Slot → (active warp, dAqk column-block) mapping (see docs/sm90_bwd_mma_plan.md) ──
+        // kg_intra slot s contributes to dQ for query block kg_intra_warp[s], using
+        // dAqk columns kg_intra_k[s]*16 .. +16 and KG pre-gated against gn_{q_block}.
+        constexpr int kg_intra_warp[6] = {1, 2, 2, 3, 3, 3};
+        constexpr int kg_intra_k[6]    = {0, 0, 1, 0, 1, 2};
+        // qkg_intra slot layout matches Prep:
+        //   slot 0: (i=1, j=0)   slot 1: (i=2, j=0)
+        //   slot 2: (i=3, j=0)   slot 3: (i=2, j=1)
+        //   slot 4: (i=3, j=1)   slot 5: (i=3, j=2)
+        constexpr int qkg_intra_j[6] = {0, 0, 0, 1, 1, 2};
+        constexpr int qkg_intra_i[6] = {1, 2, 3, 2, 3, 3};
+
+        // Type aliases for staged fragments
+        using FragC_t   = decltype(partition_fragment_C(tiled_mma, Shape<_16, Int<K_TILE>>{}));
+
+        for (; tile_scheduler.is_valid(); tile_scheduler.advance()) {
+            int A_phase = (state_phase >> (buf_idx_A + NUM_BUF)) & 1;
+            cute::wait_barrier(smem->bar_load_dA_ready[buf_idx_A], A_phase);
+
+            int tid = tile_scheduler.get_current_tile_id();
+            auto blk_coord = TileScheduler::decode_tile_coord(tid, params.h, chunk_indices_ptr, cu_len_ptr);
+            int batch_idx = get<0>(blk_coord);
+            int head_idx  = get<1>(blk_coord);
+            int tile_idx  = get<2>(blk_coord);
+            int seq_len   = cu_len_ptr[batch_idx + 1] - cu_len_ptr[batch_idx];
+            int sub_seq_len = min(T_TILE, seq_len - tile_idx * T_TILE);
+
 #if KDA_BWD_SM90_DEBUG_PRINT
-        if (blockIdx.x == 0 && thread_idx == 0) printf("[MMA] dealloc done, exiting\n");
+            if (blockIdx.x == 0 && thread_idx == 0 && tile_idx == 0 && batch_idx == 0 && head_idx == 0) {
+                printf("[MMA] tile=%d sub_seq_len=%d begin\n", tile_idx, sub_seq_len);
+            }
 #endif
+
+            Tensor sDAqk = make_tensor(make_smem_ptr(smem->smem_daqk[buf_idx_A].data()), SmemLayoutDA{});
+            Tensor sDAkk = make_tensor(make_smem_ptr(smem->smem_dakk[buf_idx_A].data()), SmemLayoutDA{});
+
+            int b_phase = 0;
+
+            for (int k_idx = 0; k_idx < K_ITERATION; ++k_idx) {
+                // === KG PHASE: dQ (intra off-diag) + dQ2 (inter diag) ===
+                cute::wait_barrier(smem->bar_kg_all_ready, b_phase);
+
+                FragC_t tDQ_acc   = partition_fragment_C(tiled_mma, Shape<_16, Int<K_TILE>>{});
+                FragC_t tDQ2_acc  = partition_fragment_C(tiled_mma, Shape<_16, Int<K_TILE>>{});
+                FragC_t tDKL_acc  = partition_fragment_C(tiled_mma, Shape<_16, Int<K_TILE>>{});
+                FragC_t tDKL2_acc = partition_fragment_C(tiled_mma, Shape<_16, Int<K_TILE>>{});
+                clear(tDQ_acc);
+                clear(tDQ2_acc);
+                clear(tDKL_acc);
+                clear(tDKL2_acc);
+
+                // ---- KG intra: 6 strict-off-diagonal (q_block, k_block) pairs ----
+                CUTE_UNROLL
+                for (int s = 0; s < 6; ++s) {
+                    if (warp_id_in_wg != kg_intra_warp[s]) continue;
+                    int q_block = kg_intra_warp[s];
+                    int k_block = kg_intra_k[s];
+
+                    auto sA_qk = local_tile(sDAqk, Shape<_16, _16>{}, make_coord(q_block, k_block));
+                    auto sA_kk = local_tile(sDAkk, Shape<_16, _16>{}, make_coord(q_block, k_block));
+                    auto tAsA_qk = thr_mma.partition_A(sA_qk);
+                    auto tAsA_kk = thr_mma.partition_A(sA_kk);
+                    auto tArA_qk = make_fragment_like(tAsA_qk);
+                    auto tArA_kk = make_fragment_like(tAsA_kk);
+                    cute::copy(tAsA_qk, tArA_qk);
+                    cute::copy(tAsA_kk, tArA_kk);
+
+                    // sub_seq_len-bounds guard (strict off-diag — no causal mask needed).
+                    {
+                        auto cA = make_identity_tensor(Shape<_16, _16>{});
+                        auto tAcA = thr_mma.partition_A(cA);
+                        CUTE_UNROLL
+                        for (int i = 0; i < size(tArA_qk); ++i) {
+                            int r = get<0>(tAcA(i));
+                            int c = get<1>(tAcA(i));
+                            int g_r = q_block * 16 + r;
+                            int g_c = k_block * 16 + c;
+                            if (g_r >= sub_seq_len || g_c >= sub_seq_len) {
+                                tArA_qk(i) = 0.0f;
+                                tArA_kk(i) = 0.0f;
+                            }
+                        }
+                    }
+
+                    Tensor sB = make_tensor(make_smem_ptr(smem->kg_all.intra[s].data()),
+                                            SmemLayoutMatBTF32Tranposed<1>{});
+                    auto tBsB = thr_mma.partition_B(sB);
+                    auto tBrB = thr_mma.partition_fragment_B(sB);
+                    cute::copy(tBsB, tBrB);
+
+                    auto tArA_qk_tf32 = recast<tfloat32_t>(tArA_qk);
+                    auto tArA_kk_tf32 = recast<tfloat32_t>(tArA_kk);
+                    auto tBrB_tf32    = recast<tfloat32_t>(tBrB);
+                    cute::gemm(tiled_mma, tArA_qk_tf32, tBrB_tf32, tDQ_acc);
+                    cute::gemm(tiled_mma, tArA_kk_tf32, tBrB_tf32, tDKL_acc);
+                }
+
+                // ---- KG inter: 4 diagonal blocks with causal mask ----
+                CUTE_UNROLL
+                for (int s = 0; s < 4; ++s) {
+                    if (warp_id_in_wg != s) continue;
+                    int i_block = s;
+
+                    auto sA_qk = local_tile(sDAqk, Shape<_16, _16>{}, make_coord(i_block, i_block));
+                    auto sA_kk = local_tile(sDAkk, Shape<_16, _16>{}, make_coord(i_block, i_block));
+                    auto tAsA_qk = thr_mma.partition_A(sA_qk);
+                    auto tAsA_kk = thr_mma.partition_A(sA_kk);
+                    auto tArA_qk = make_fragment_like(tAsA_qk);
+                    auto tArA_kk = make_fragment_like(tAsA_kk);
+                    cute::copy(tAsA_qk, tArA_qk);
+                    cute::copy(tAsA_kk, tArA_kk);
+
+                    {
+                        auto cA = make_identity_tensor(Shape<_16, _16>{});
+                        auto tAcA = thr_mma.partition_A(cA);
+                        CUTE_UNROLL
+                        for (int i = 0; i < size(tArA_qk); ++i) {
+                            int r = get<0>(tAcA(i));
+                            int c = get<1>(tAcA(i));
+                            int g_r = i_block * 16 + r;
+                            int g_c = i_block * 16 + c;
+                            bool keep = (r >= c) && (g_r < sub_seq_len) && (g_c < sub_seq_len);
+                            if (!keep) {
+                                tArA_qk(i) = 0.0f;
+                                tArA_kk(i) = 0.0f;
+                            }
+                        }
+                    }
+
+                    Tensor sB = make_tensor(make_smem_ptr(smem->kg_all.inter[s].data()),
+                                            SmemLayoutMatBTF32Tranposed<1>{});
+                    auto tBsB = thr_mma.partition_B(sB);
+                    auto tBrB = thr_mma.partition_fragment_B(sB);
+                    cute::copy(tBsB, tBrB);
+
+                    auto tArA_qk_tf32 = recast<tfloat32_t>(tArA_qk);
+                    auto tArA_kk_tf32 = recast<tfloat32_t>(tArA_kk);
+                    auto tBrB_tf32    = recast<tfloat32_t>(tBrB);
+                    cute::gemm(tiled_mma, tArA_qk_tf32, tBrB_tf32, tDQ2_acc);
+                    cute::gemm(tiled_mma, tArA_kk_tf32, tBrB_tf32, tDKL2_acc);
+                }
+
+                // R2S: each warp writes its 16-row slice to smem_mma_dq / smem_mma_dq2 / dk_lower buffers.
+                {
+                    Tensor sDQ   = make_tensor(make_smem_ptr(smem->smem_mma_dq.data()),               SmemLayoutInputFP32{});
+                    Tensor sDQ2  = make_tensor(make_smem_ptr(smem->smem_mma_dq2.data()),              SmemLayoutInputFP32{});
+                    Tensor sDKL  = make_tensor(make_smem_ptr(smem->smem_mma_dk_lower_intra.data()),   SmemLayoutInputFP32{});
+                    Tensor sDKL2 = make_tensor(make_smem_ptr(smem->smem_mma_dk_lower_inter.data()),   SmemLayoutInputFP32{});
+                    auto sDQ_sub   = local_tile(sDQ,   Shape<_16, Int<K_TILE>>{}, make_coord(warp_id_in_wg, _0{}));
+                    auto sDQ2_sub  = local_tile(sDQ2,  Shape<_16, Int<K_TILE>>{}, make_coord(warp_id_in_wg, _0{}));
+                    auto sDKL_sub  = local_tile(sDKL,  Shape<_16, Int<K_TILE>>{}, make_coord(warp_id_in_wg, _0{}));
+                    auto sDKL2_sub = local_tile(sDKL2, Shape<_16, Int<K_TILE>>{}, make_coord(warp_id_in_wg, _0{}));
+                    auto tCsDQ   = thr_mma.partition_C(sDQ_sub);
+                    auto tCsDQ2  = thr_mma.partition_C(sDQ2_sub);
+                    auto tCsDKL  = thr_mma.partition_C(sDKL_sub);
+                    auto tCsDKL2 = thr_mma.partition_C(sDKL2_sub);
+                    cute::copy(tDQ_acc,   tCsDQ);
+                    cute::copy(tDQ2_acc,  tCsDQ2);
+                    cute::copy(tDKL_acc,  tCsDKL);
+                    cute::copy(tDKL2_acc, tCsDKL2);
+                }
+
+                fence_view_async_shared();
+                cute::arrive_barrier(smem->bar_mma_dq_done);
+
+                // === QKG PHASE: dKt (transposed A, into smem_mma_dq) ===
+                cute::wait_barrier(smem->bar_qkg_all_ready, b_phase);
+                // Wait for Prep to finish reading dQ/dQ2 before we overwrite smem_mma_dq with dKt.
+                cute::wait_barrier(smem->bar_prep_dq_consumed, b_phase);
+
+                FragC_t tDKT_intra_acc = partition_fragment_C(tiled_mma, Shape<_16, Int<K_TILE>>{});
+                FragC_t tDKT_inter_acc = partition_fragment_C(tiled_mma, Shape<_16, Int<K_TILE>>{});
+                clear(tDKT_intra_acc);
+                clear(tDKT_inter_acc);
+
+                // A layout for dKt MMA: (M=16, K=32) where K=[dAqk^T 16 rows | dAkk^T 16 rows].
+                // We build A by manual scalar SMEM read using identity-tensor coordinates,
+                // because dAqk/dAkk must be transposed and stacked — no simple local_tile view.
+                using AShape = Shape<_16, Int<2 * SUB_T_TILE>>;
+                // Build a "dummy" smem-backed tensor solely to let partition_fragment_A
+                // derive the per-thread register layout. We fill values manually below.
+                auto sA_proto = local_tile(sDAqk, Shape<_16, Int<2 * SUB_T_TILE>>{}, make_coord(0, 0));
+
+                // ---- QKG intra: 6 strict-off-diagonal (i, j) pairs (i > j) ----
+                CUTE_UNROLL
+                for (int s = 0; s < 6; ++s) {
+                    if (warp_id_in_wg != qkg_intra_j[s]) continue;
+                    int i_block = qkg_intra_i[s];
+                    int j_block = qkg_intra_j[s];
+
+                    auto cA   = make_identity_tensor(AShape{});
+                    auto tAcA = thr_mma.partition_A(cA);
+                    auto tArA = thr_mma.partition_fragment_A(sA_proto);
+                    CUTE_UNROLL
+                    for (int i = 0; i < size(tArA); ++i) {
+                        int r = get<0>(tAcA(i));
+                        int c = get<1>(tAcA(i));
+                        int g_j = j_block * 16 + r;
+                        int g_i;
+                        float v;
+                        if (c < 16) {
+                            g_i = i_block * 16 + c;
+                            v   = sDAqk(g_i, g_j);
+                        } else {
+                            g_i = i_block * 16 + (c - 16);
+                            v   = sDAkk(g_i, g_j);
+                        }
+                        bool keep = (g_i < sub_seq_len) && (g_j < sub_seq_len);
+                        tArA(i) = keep ? tfloat32_t(v) : tfloat32_t(0.0f);
+                    }
+
+                    Tensor sB = make_tensor(make_smem_ptr(smem->qkg_all.intra[s].data()),
+                                            SmemLayoutMatBTF32Tranposed<2>{});
+                    auto tBsB = thr_mma.partition_B(sB);
+                    auto tBrB = thr_mma.partition_fragment_B(sB);
+                    cute::copy(tBsB, tBrB);
+
+                    cute::gemm(tiled_mma, tArA, tBrB, tDKT_intra_acc);
+                }
+
+                // ---- QKG inter: 4 diagonal blocks with causal mask ----
+                CUTE_UNROLL
+                for (int s = 0; s < 4; ++s) {
+                    if (warp_id_in_wg != s) continue;
+                    int block = s;
+
+                    auto cA   = make_identity_tensor(AShape{});
+                    auto tAcA = thr_mma.partition_A(cA);
+                    auto tArA = thr_mma.partition_fragment_A(sA_proto);
+                    CUTE_UNROLL
+                    for (int i = 0; i < size(tArA); ++i) {
+                        int r = get<0>(tAcA(i));
+                        int c = get<1>(tAcA(i));
+                        int g_j = block * 16 + r;
+                        int g_i;
+                        float v;
+                        if (c < 16) {
+                            g_i = block * 16 + c;
+                            v   = sDAqk(g_i, g_j);
+                        } else {
+                            g_i = block * 16 + (c - 16);
+                            v   = sDAkk(g_i, g_j);
+                        }
+                        bool keep = (g_i >= g_j) && (g_i < sub_seq_len) && (g_j < sub_seq_len);
+                        tArA(i) = keep ? tfloat32_t(v) : tfloat32_t(0.0f);
+                    }
+
+                    Tensor sB = make_tensor(make_smem_ptr(smem->qkg_all.inter[s].data()),
+                                            SmemLayoutMatBTF32Tranposed<2>{});
+                    auto tBsB = thr_mma.partition_B(sB);
+                    auto tBrB = thr_mma.partition_fragment_B(sB);
+                    cute::copy(tBsB, tBrB);
+
+                    cute::gemm(tiled_mma, tArA, tBrB, tDKT_inter_acc);
+                }
+
+                // R2S: intra off-diag dkt → smem_mma_dq (lower half reads with next_top scale);
+                //      inter diagonal dkt → smem_mma_dq2 (upper half reads with mid scale).
+                {
+                    Tensor sDKt_intra = make_tensor(make_smem_ptr(smem->smem_mma_dq.data()),  SmemLayoutInputFP32{});
+                    Tensor sDKt_inter = make_tensor(make_smem_ptr(smem->smem_mma_dq2.data()), SmemLayoutInputFP32{});
+                    auto sDKt_intra_sub = local_tile(sDKt_intra, Shape<_16, Int<K_TILE>>{}, make_coord(warp_id_in_wg, _0{}));
+                    auto sDKt_inter_sub = local_tile(sDKt_inter, Shape<_16, Int<K_TILE>>{}, make_coord(warp_id_in_wg, _0{}));
+                    auto tCsDKt_intra = thr_mma.partition_C(sDKt_intra_sub);
+                    auto tCsDKt_inter = thr_mma.partition_C(sDKt_inter_sub);
+                    cute::copy(tDKT_intra_acc, tCsDKt_intra);
+                    cute::copy(tDKT_inter_acc, tCsDKt_inter);
+                }
+
+                fence_view_async_shared();
+                cute::arrive_barrier(smem->bar_mma_dkt_done);
+
+                b_phase ^= 1;
+            }
+
+            state_phase ^= 1 << (buf_idx_A + NUM_BUF);
+            buf_idx_A = (buf_idx_A + 1) % NUM_BUF;
+
+#if KDA_BWD_SM90_DEBUG_PRINT
+            if (blockIdx.x == 0 && thread_idx == 0) printf("[MMA] tile_idx=%d done\n", tile_idx);
+#endif
+        }
 
         // =================================================================
         // Prep warpgroups — scalar B-operand setup + epilogue

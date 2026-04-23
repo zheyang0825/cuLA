@@ -311,27 +311,28 @@ __forceinline__ __device__ void
 epilogue_output_dq(
     Q_TENSOR& sQ, DQ_TENSOR& sDQ,
     int idx_in_warpgroup, int sub_seq_len,
-    float* res, __nv_bfloat16* dq_out_base) {
+    float* res, float* dq_out_base) {
     if (idx_in_warpgroup % 64 < sub_seq_len) {
         int row = idx_in_warpgroup % 64;
         for (int i = 0; i < K_TILE_ / 16; ++i) {
-            bf16x16 dq_res;
+            float dq_res_fp32[16];
             for (int j = 0; j < 4; ++j) {
                 float4 tmp_dq = *reinterpret_cast<float4*>(&sDQ(row, K_OFFSET + i * 16 + j * 4));
                 for (int k = 0; k < 2; ++k) {
                     reinterpret_cast<float2*>(&tmp_dq)[k] = float2_add(
                         reinterpret_cast<float2*>(&tmp_dq)[k],
                         reinterpret_cast<float2*>(&res[i * 16])[j * 2 + k]);
-                    reinterpret_cast<__nv_bfloat162*>(&dq_res)[j * 2 + k] =
-                        __float22bfloat162_rn(reinterpret_cast<float2*>(&tmp_dq)[k]);
                 }
+                *reinterpret_cast<float4*>(&dq_res_fp32[j * 4]) = tmp_dq;
                 nvbf16x4 tmp_q = *reinterpret_cast<nvbf16x4*>(&sQ(row, K_OFFSET + i * 16 + j * 4));
                 reinterpret_cast<float2*>(res)[i * 8 + j * 2] =
                     float2_mul(reinterpret_cast<float2*>(res)[i * 8 + j * 2], __bfloat1622float2(tmp_q.a));
                 reinterpret_cast<float2*>(res)[i * 8 + j * 2 + 1] =
                     float2_mul(reinterpret_cast<float2*>(res)[i * 8 + j * 2 + 1], __bfloat1622float2(tmp_q.b));
             }
-            store_256B(&dq_res, dq_out_base + i * 16);
+            // Write 16 fp32 (64 B) via two 32-B stores.
+            store_256B(&dq_res_fp32[0], dq_out_base + i * 16);
+            store_256B(&dq_res_fp32[8], dq_out_base + i * 16 + 8);
         }
     }
 }
@@ -463,11 +464,11 @@ __forceinline__ __device__ void
 epilogue_output_dk(
     DK_TENSOR& sDK, DKT_TENSOR& sDKT_0,
     int idx_in_warpgroup, int sub_seq_len,
-    float* res, float* res_dkt, __nv_bfloat16* dk_out_base) {
+    float* res, float* res_dkt, float* dk_out_base) {
     int row = idx_in_warpgroup % 64;
     if (row < sub_seq_len) {
         for (int i = 0; i < K_TILE_ / 16; ++i) {
-            bf16x16 dk_res;
+            float dk_res_fp32[16];
             for (int j = 0; j < 4; ++j) {
                 int base = i * 16 + j * 4;
                 float4 dkt_sub  = *reinterpret_cast<float4*>(&sDKT_0(row, K_OFFSET + base));
@@ -478,11 +479,12 @@ epilogue_output_dk(
                     sum = float2_add(sum, reinterpret_cast<float2*>(&dk_input)[k]);
                     reinterpret_cast<float2*>(res + base)[k] = float2_add(
                         reinterpret_cast<float2*>(res + base)[k], sum);
-                    reinterpret_cast<__nv_bfloat162*>(&dk_res)[j * 2 + k] =
-                        __float22bfloat162_rn(reinterpret_cast<float2*>(res + base)[k]);
+                    reinterpret_cast<float2*>(&dk_res_fp32[j * 4])[k] =
+                        reinterpret_cast<float2*>(res + base)[k];
                 }
             }
-            store_256B(&dk_res, dk_out_base + i * 16);
+            store_256B(&dk_res_fp32[0], dk_out_base + i * 16);
+            store_256B(&dk_res_fp32[8], dk_out_base + i * 16 + 8);
         }
     }
 }
