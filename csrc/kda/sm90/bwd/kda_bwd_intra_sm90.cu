@@ -18,7 +18,7 @@
 
 // Debug print switch (gated to one tile / one warp to limit volume)
 #ifndef KDA_BWD_SM90_DEBUG_PRINT
-#define KDA_BWD_SM90_DEBUG_PRINT 1
+#define KDA_BWD_SM90_DEBUG_PRINT 0
 #endif
 
 namespace sm90_bwd {
