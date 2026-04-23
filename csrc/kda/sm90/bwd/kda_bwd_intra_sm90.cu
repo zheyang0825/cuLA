@@ -271,13 +271,9 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
     // =================================================================
     if (role == WGRole::LdSt) {
         if (elect_one_sync()) {
-            int tile_counter = 0;
             for (; tile_scheduler.is_valid(); tile_scheduler.advance()) {
                 int A_phase = (state_phase >> (buf_idx_A + NUM_BUF)) & 1;
-                
-                if (tile_counter >= NUM_BUF) {
-                    cute::wait_barrier(smem->bar_dA_free[buf_idx_A], A_phase);
-                }
+                cute::wait_barrier(smem->bar_dA_free[buf_idx_A], A_phase ^ 1);
 
                 int tid = tile_scheduler.get_current_tile_id();
 
@@ -326,11 +322,7 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
 
                 for (int k_idx = 0; k_idx < K_ITERATION; ++k_idx) {
                     int local_phase = (state_phase >> buf_idx_value) & 1;
-
-                    // Wait when a value buffer slot wraps around and is reused.
-                    if (k_idx >= NUM_BUF) {
-                        cute::wait_barrier(smem->bar_buf_free[buf_idx_value], local_phase);
-                    }
+                    cute::wait_barrier(smem->bar_buf_free[buf_idx_value], local_phase ^ 1);
 
                     // TMA load Q, K, G + dQ, dK, dG inter-chunk.
                     {
@@ -395,7 +387,6 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
 
                 state_phase ^= 1 << (buf_idx_A + NUM_BUF);
                 buf_idx_A = (buf_idx_A + 1) % NUM_BUF;
-                ++tile_counter;
             }
         }
 
