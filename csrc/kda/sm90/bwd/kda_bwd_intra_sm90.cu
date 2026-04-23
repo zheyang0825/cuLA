@@ -1,6 +1,6 @@
 // SM90 KDA Backward Intra-Chunk Kernel — Phase 1: Framework + Infrastructure
 //
-// Design: 512 threads = 4 WG (LdSt / MMA / Prep×2)
+// Design: 416 threads = MMA WG + Prep×2 + Load warp
 // MMA: SM80 mma.sync TF32 sub-chunk loop (16×8×8)
 // B operands: fp32 row-major (hardware truncation to TF32)
 // Causal mask: on-the-fly in registers during A operand loading
@@ -30,8 +30,16 @@ constexpr int K_SIZE = 128;                   // head dimension
 constexpr int K_TILE = 32;                    // per-ki tile width
 constexpr int K_ITERATION = K_SIZE / K_TILE;  // = 4
 constexpr int NUM_BUF = 2;                    // double buffer stages
-constexpr int NUM_THREADS = 512;              // 4 WG × 128
-constexpr int NUM_WG = 4;
+constexpr int NUM_MMA_THREADS = 128;
+constexpr int NUM_PREP_THREADS = 256;
+constexpr int NUM_LOAD_THREADS = 32;
+constexpr int MMA_THREAD_OFFSET = 0;
+constexpr int PREP_THREAD_OFFSET = MMA_THREAD_OFFSET + NUM_MMA_THREADS;
+constexpr int LOAD_THREAD_OFFSET = PREP_THREAD_OFFSET + NUM_PREP_THREADS;
+constexpr int NUM_THREADS = NUM_MMA_THREADS + NUM_PREP_THREADS + NUM_LOAD_THREADS;
+constexpr int NUM_MMA_WARPS = NUM_MMA_THREADS / 32;
+constexpr int NUM_PREP_WARPS = NUM_PREP_THREADS / 32;
+constexpr int LOAD_WARP_IDX = NUM_MMA_WARPS + NUM_PREP_WARPS;
 constexpr int CHUNK_SIZE = 64;
 
 // Clamped exp2f to prevent inf/NaN from large gate differences across sub-tiles
@@ -55,12 +63,11 @@ f2u(float f) {
 }
 
 // =====================================================================
-// WG Role Assignment
+// Thread Role Assignment
 // =====================================================================
-// WG0 (threads 0-127):   LdSt
-// WG1 (threads 128-255): MMA
-// WG2 (threads 256-383): Prep
-// WG3 (threads 384-511): Prep
+// threads   0-127: MMA
+// threads 128-383: Prep
+// threads 384-415: LdSt
 
 enum class WGRole {
     LdSt = 0,
@@ -69,18 +76,12 @@ enum class WGRole {
 };
 
 __forceinline__ __device__ WGRole
-get_wg_role() {
-    int wg_idx = threadIdx.x / 128;
-    if (wg_idx == 0)
-        return WGRole::LdSt;
-    if (wg_idx == 1)
+get_wg_role(int warp_idx) {
+    if (warp_idx < NUM_MMA_WARPS)
         return WGRole::MMA;
-    return WGRole::Prep;  // WG2, WG3
-}
-
-__forceinline__ __device__ int
-get_warp_idx_in_wg() {
-    return (threadIdx.x % 128) / 32;
+    if (warp_idx < NUM_MMA_WARPS + NUM_PREP_WARPS)
+        return WGRole::Prep;
+    return WGRole::LdSt;
 }
 
 // =====================================================================
@@ -88,75 +89,83 @@ get_warp_idx_in_wg() {
 // =====================================================================
 
 // Q, K: bf16 [64, 32] — TMA loaded
-using SmemLayoutInputBF16 = Layout<Shape<Int<T_TILE>, Int<K_TILE>>, Stride<Int<K_TILE>, _1>>;
+using SmemLayoutInputBF16 = decltype(coalesce(tile_to_shape(
+    GMMA::Layout_K_SW64_Atom<bf16>{},
+    Shape<Int<T_TILE>, Int<K_TILE>>{},
+    Step<_1, _2>{}
+), Shape<_1, _1>{}));
 
 // G, dQ_in, dK_in, dG_in, dQ_out, dK_out: fp32 [64, 32] — TMA loaded / MMA R2S
-using SmemLayoutInputFP32 = Layout<Shape<Int<T_TILE>, Int<K_TILE>>, Stride<Int<K_TILE>, _1>>;
+using SmemLayoutInputFP32 = decltype(coalesce(tile_to_shape(
+    GMMA::Layout_K_SW128_Atom<float>{},
+    Shape<Int<T_TILE>, Int<K_TILE>>{},
+    Step<_1, _2>{}
+), Shape<_1, _1>{}));
 
 // dAqk, dAkk: fp32 [64, 64] — TMA loaded
-using SmemLayoutDA = Layout<Shape<Int<T_TILE>, Int<T_TILE>>, Stride<Int<T_TILE>, _1>>;
+using SmemLayoutDA = decltype(coalesce(tile_to_shape(
+    UMMA::Layout_K_SW64_Atom<float>{},
+    Shape<Int<T_TILE>, Int<T_TILE>>{},
+    Step<_1, _2>{}
+), Shape<_1, _1>{}));
 
 // KG, QG, KBG: fp32 [64, 32] — Prep element-wise, MMA thread load
-using SmemLayoutB = Layout<Shape<Int<T_TILE>, Int<K_TILE>>, Stride<Int<K_TILE>, _1>>;
+template<int NUM_TILES>
+using SmemLayoutMatBTF32Tranposed = decltype(coalesce(tile_to_shape(
+    UMMA::Layout_MN_SW128_32B_Atom<tf32>{},
+    Shape<Int<K_TILE>, Int<SUB_T_TILE * NUM_TILES>>{},
+    Step<_1, _2>{}
+), Shape<_1, _1>{}));
 
-// Beta: fp32 [64]
-// Beta is loaded via st.global (not TMA)
-
-// dB: fp32 [64]
-using SmemLayoutDB = Layout<Shape<Int<T_TILE>>, Stride<_1>>;
 
 // =====================================================================
 // SharedStorage (~201 KB, within 228 KB limit)
 // =====================================================================
 struct SharedStorage {
     // TMA-loaded input buffers (double-buffered per ki)
-    alignas(128) cute::array_aligned<bf16, T_TILE * K_TILE> smem_q[NUM_BUF];   // 2 × 4 KB = 8 KB
-    alignas(128) cute::array_aligned<bf16, T_TILE * K_TILE> smem_k[NUM_BUF];   // 2 × 4 KB = 8 KB
-    alignas(128) cute::array_aligned<float, T_TILE * K_TILE> smem_g[NUM_BUF];  // 2 × 8 KB = 16 KB
+    array_aligned<bf16, cosize_v<SmemLayoutInputBF16>> smem_q[NUM_BUF];   // 2 × 4 KB = 8 KB
+    array_aligned<bf16, cosize_v<SmemLayoutInputBF16>> smem_k[NUM_BUF];   // 2 × 4 KB = 8 KB
+    array_aligned<float, cosize_v<SmemLayoutInputFP32>> smem_g[NUM_BUF];  // 2 × 8 KB = 16 KB
+
+    // dAqk, dAkk: loaded once per tile (double-buffered across tiles)
+    array_aligned<float, cosize_v<SmemLayoutDA>> smem_daqk[NUM_BUF];  // 16 KB
+    array_aligned<float, cosize_v<SmemLayoutDA>> smem_dakk[NUM_BUF];  // 16 KB
 
     // dQ, dK, dG inter-chunk input (double-buffered per ki)
-    alignas(128) cute::array_aligned<float, T_TILE * K_TILE> smem_dq_in[NUM_BUF];  // 2 × 8 KB = 16 KB
-    alignas(128) cute::array_aligned<float, T_TILE * K_TILE> smem_dk_in[NUM_BUF];  // 2 × 8 KB = 16 KB
-    alignas(128) cute::array_aligned<float, T_TILE * K_TILE> smem_dg_in[NUM_BUF];  // 2 × 8 KB = 16 KB
+    array_aligned<float, cosize_v<SmemLayoutInputFP32>> smem_dq_in[NUM_BUF];  // 2 × 8 KB = 16 KB
+    array_aligned<float, cosize_v<SmemLayoutInputFP32>> smem_dk_in[NUM_BUF];  // 2 × 8 KB = 16 KB
+    array_aligned<float, cosize_v<SmemLayoutInputFP32>> smem_dg_in[NUM_BUF];  // 2 × 8 KB = 16 KB
 
-    // dAqk, dAkk: loaded once per tile (single-buffered)
-    alignas(128) cute::array_aligned<float, T_TILE * T_TILE> smem_daqk;  // 16 KB
-    alignas(128) cute::array_aligned<float, T_TILE * T_TILE> smem_dakk;  // 16 KB
-
-    // B operands for MMA: KG, QG, KBG (double-buffered per ki)
-    alignas(128) cute::array_aligned<float, T_TILE * K_TILE> smem_kg[NUM_BUF];   // 2 × 8 KB = 16 KB
-    alignas(128) cute::array_aligned<float, T_TILE * K_TILE> smem_qg[NUM_BUF];   // 2 × 8 KB = 16 KB
-    alignas(128) cute::array_aligned<float, T_TILE * K_TILE> smem_kbg[NUM_BUF];  // 2 × 8 KB = 16 KB
-
-    // MMA output (double-buffered per ki)
-    alignas(128) cute::array_aligned<float, T_TILE * K_TILE> smem_dq_out[NUM_BUF];  // 2 × 8 KB = 16 KB
-    alignas(128)
-        cute::array_aligned<float, T_TILE * K_TILE> smem_dk_out[NUM_BUF];  // 2 × 8 KB = 16 KB (dK_lower from Pass 2)
-    alignas(128) cute::array_aligned<float, T_TILE * K_TILE> smem_dk_upper_out[NUM_BUF];  // 2 × 8 KB = 16 KB (dK_upper
-                                                                                          // from Pass 3+4)
+    // KG
+    struct {
+        array_aligned<tf32, cosize_v<SmemLayoutMatBTF32Tranposed<1>>> intra[6];
+        array_aligned<tf32, cosize_v<SmemLayoutMatBTF32Tranposed<1>>> inter[4];
+    } kg_all;  // 20480 bytes, single-buffered
+    
+    // QG, KBG
+    struct {
+        array_aligned<tf32, cosize_v<SmemLayoutMatBTF32Tranposed<2>>> intra[6];
+        array_aligned<tf32, cosize_v<SmemLayoutMatBTF32Tranposed<2>>> inter[4];
+    } qkg_all; // 40960 bytes, single-buffered
 
     // Scalar data
-    alignas(16) float beta_smem[T_TILE];  // 256 B
-    alignas(16) float db_accum[T_TILE];   // 256 B (cross-ki dB accumulator)
+    array_aligned<float, T_TILE> beta_smem[NUM_BUF];  // double-buffered with dA
+    array_aligned<float, T_TILE> db_accum;   // 256 B (cross-ki dB accumulator)
 
     // ── Pipeline barriers ──
-    // TmaAsync pipelines: LdSt → Prep
-    alignas(16) cute::uint64_t bar_qkg_ready[NUM_BUF];   // Q, K, G + dQ, dK, dG inter loaded
-    alignas(16) cute::uint64_t bar_dA_ready;             // dAqk, dAkk, beta loaded
+    // Load → consumers
+    alignas(16) cute::uint64_t bar_load_qkg_ready[NUM_BUF];
+    alignas(16) cute::uint64_t bar_load_dA_ready[NUM_BUF];
 
-    // Async pipelines: Prep → MMA
-    alignas(16) cute::uint64_t bar_kg_ready[NUM_BUF];   // KG double-buffered
-    alignas(16) cute::uint64_t bar_qg_ready[NUM_BUF];   // QG double-buffered
-    alignas(16) cute::uint64_t bar_kbg_ready[NUM_BUF];  // KBG double-buffered
+    // Prep → MMA
+    alignas(16) cute::uint64_t bar_kg_all_ready, bar_qkg_all_ready;
 
     // Async pipelines: MMA → Prep
     alignas(16) cute::uint64_t bar_mma_ki_ready[NUM_BUF];  // dQ+dK per-ki output ready
 
-    // Async pipeline: Prep → LdSt
-    alignas(16) cute::uint64_t bar_epilogue_done;  // dB ready for store
-
-    // Flow control
-    alignas(16) cute::uint64_t bar_buf_free[NUM_BUF];  // buffer free signal
+    // Prep → Load
+    alignas(16) cute::uint64_t bar_dA_free[NUM_BUF];
+    alignas(16) cute::uint64_t bar_buf_free[NUM_BUF];  // value-buffer free signal
 };
 
 // =====================================================================
@@ -196,11 +205,9 @@ __global__ void
 __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
     __grid_constant__ const KDA_bwd_intra_params params, __grid_constant__ const TmaParamsT tma_params) {
     const int thread_idx = threadIdx.x;
-    const int wg_idx = thread_idx / 128;
-    const int idx_in_wg = thread_idx % 128;
-    const int warp_idx_in_wg = idx_in_wg / 32;
-    const int lane_idx = thread_idx % 32;
-    WGRole role = get_wg_role();
+    const int warp_idx = cutlass::canonical_warp_idx_sync();
+    const int idx_in_warp = thread_idx % 32;
+    WGRole role = get_wg_role(warp_idx);
 
     TileScheduler tile_scheduler{params.tile_scheduler_params};
 
@@ -210,8 +217,8 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
     int* chunk_indices_ptr = (int*)params.chunk_indices_ptr;
     int* cu_len_ptr = (int*)params.cu_seqlens_ptr;
 
-    // ── Barrier initialization (WG0 / warp0 / elected thread) ──
-    if (wg_idx == 0 && warp_idx_in_wg == 0 && elect_one_sync()) {
+    // ── Barrier initialization (Load warp / elected thread) ──
+    if (warp_idx == LOAD_WARP_IDX && elect_one_sync()) {
         // Prefetch TMA descriptors
         cute::prefetch_tma_descriptor(tma_params.tma_q.get_tma_descriptor());
         cute::prefetch_tma_descriptor(tma_params.tma_k.get_tma_descriptor());
@@ -222,29 +229,26 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
         cute::prefetch_tma_descriptor(tma_params.tma_dk.get_tma_descriptor());
         cute::prefetch_tma_descriptor(tma_params.tma_dg.get_tma_descriptor());
 
-        // TmaAsync barriers: LdSt → Prep (arrival count = 1 for TMA)
+        // Load → consumers
         for (int i = 0; i < NUM_BUF; ++i) {
-            cute::initialize_barrier(smem->bar_qkg_ready[i], 1);
+            cute::initialize_barrier(smem->bar_load_qkg_ready[i], 1);
         }
-        cute::initialize_barrier(smem->bar_dA_ready, 2);  // TMA (arrive_expect_tx) + warp1 explicit arrive
+        for (int i = 0; i < NUM_BUF; ++i) {
+            cute::initialize_barrier(smem->bar_load_dA_ready[i], 2);  // TMA + elected Load thread
+        }
 
-        // Async barriers: Prep → MMA (arrival count = 256 for Prep WGs)
-        for (int i = 0; i < NUM_BUF; ++i) {
-            cute::initialize_barrier(smem->bar_kg_ready[i], 256);
-            cute::initialize_barrier(smem->bar_qg_ready[i], 256);
-            cute::initialize_barrier(smem->bar_kbg_ready[i], 256);
-        }
+        // Prep → MMA
+        cute::initialize_barrier(smem->bar_kg_all_ready, 256);
+        cute::initialize_barrier(smem->bar_qkg_all_ready, 256);
 
         // Async barriers: MMA → Prep (arrival count = 128 for MMA WG)
         for (int i = 0; i < NUM_BUF; ++i) {
             cute::initialize_barrier(smem->bar_mma_ki_ready[i], 128);
         }
 
-        // Prep → LdSt
-        cute::initialize_barrier(smem->bar_epilogue_done, 256);
-
-        // Buffer free signals (arrival count = 256 for Prep)
+        // Prep → Load
         for (int i = 0; i < NUM_BUF; ++i) {
+            cute::initialize_barrier(smem->bar_dA_free[i], 256);
             cute::initialize_barrier(smem->bar_buf_free[i], 256);
         }
 
@@ -254,28 +258,27 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
     __syncthreads();
 
     // ── Phase tracking ──
-    // Double-buffered barriers need per-buffer phase tracking because
-    // each buffer's barrier has an independent phase counter.
-    int buf_idx = 0;                     // double-buffer index for ki data
-    int phase_qkg[NUM_BUF] = {0, 0};     // barrier phase for qkg_pipeline (Q,K,G + dQ,dK,dG)
-    int phase_dA = 0;                    // barrier phase for dA_pipeline (single)
-    int phase_kg[NUM_BUF] = {0, 0};      // barrier phase for kg_pipeline
-    int phase_qg[NUM_BUF] = {0, 0};      // barrier phase for qg_pipeline
-    int phase_kbg[NUM_BUF] = {0, 0};     // barrier phase for kbg_pipeline
-    int phase_mma_ki[NUM_BUF] = {0, 0};  // barrier phase for mma_ki_pipeline
-    int phase_epi = 0;                   // barrier phase for epilogue_pipeline (single)
-    int phase_free[NUM_BUF] = {0, 0};    // barrier phase for buf_free
+    // state_phase packs the current phase bit of each double-buffered resource:
+    // low NUM_BUF bits track value-buffer phases, high NUM_BUF bits track dA/beta phases.
+    int state_phase = 0;
+    // buf_idx_A selects which dA/beta slot is currently owned by this tile.
+    int buf_idx_A = 0;
+    // buf_idx_value selects which per-ki Q/K/G/dQ/dK/dG slot is active in the current step.
+    int buf_idx_value = 0;
 
     // =================================================================
-    // WG0: LdSt — TMA loads + writes
+    // Load warp — TMA loads + writes
     // =================================================================
     if (role == WGRole::LdSt) {
-        cutlass::arch::warpgroup_reg_dealloc<REG_LDST>();
-
-        // ── Warp0: TMA load Q, K, G + dQ, dK, dG per ki (double-buffered) ──
-        if (warp_idx_in_wg == 0 && elect_one_sync()) {
-            bool first_tile = true;
+        if (elect_one_sync()) {
+            int tile_counter = 0;
             for (; tile_scheduler.is_valid(); tile_scheduler.advance()) {
+                int A_phase = (state_phase >> (buf_idx_A + NUM_BUF)) & 1;
+                
+                if (tile_counter >= NUM_BUF) {
+                    cute::wait_barrier(smem->bar_dA_free[buf_idx_A], A_phase);
+                }
+
                 int tid = tile_scheduler.get_current_tile_id();
 
                 auto blk_coord = TileScheduler::decode_tile_coord(tid, params.h, chunk_indices_ptr, cu_len_ptr);
@@ -283,29 +286,63 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
                 int head_idx = get<1>(blk_coord);
                 int tile_idx = get<2>(blk_coord);
                 int token_offset = cu_len_ptr[batch_idx];
+                int seq_len = cu_len_ptr[batch_idx + 1] - cu_len_ptr[batch_idx];
+                int sub_seq_len = min(T_TILE, seq_len - tile_idx * T_TILE);
+
+
+                // TMA load dAqk, dAkk.
+                {
+                    Tensor sDAqk = make_tensor(make_smem_ptr(smem->smem_daqk[buf_idx_A].data()), SmemLayoutDA{});
+                    Tensor sDAkk = make_tensor(make_smem_ptr(smem->smem_dakk[buf_idx_A].data()), SmemLayoutDA{});
+                    int tma_bytes_da = sizeof(make_tensor_like(sDAqk)) + sizeof(make_tensor_like(sDAkk));
+
+                    Tensor mDaqk = domain_offset(
+                        make_coord(token_offset, _0{}, _0{}), tma_params.tma_dAqk.get_tma_tensor(tma_params.shape_da));
+                    Tensor mDakk = domain_offset(
+                        make_coord(token_offset, _0{}, _0{}), tma_params.tma_dAkk.get_tma_tensor(tma_params.shape_da));
+                    Tensor gDaqk = local_tile(
+                        mDaqk(_, _, head_idx), make_shape(Int<T_TILE>{}, Int<T_TILE>{}), make_coord(tile_idx, _0{}));
+                    Tensor gDakk = local_tile(
+                        mDakk(_, _, head_idx), make_shape(Int<T_TILE>{}, Int<T_TILE>{}), make_coord(tile_idx, _0{}));
+
+                    cute::set_barrier_transaction_bytes(smem->bar_load_dA_ready[buf_idx_A], tma_bytes_da);
+                    launch_tma_copy(tma_params.tma_dAqk, gDaqk, sDAqk, smem->bar_load_dA_ready[buf_idx_A]);
+                    launch_tma_copy(tma_params.tma_dAkk, gDakk, sDAkk, smem->bar_load_dA_ready[buf_idx_A]);
+                }
+
+                // Load beta via the same elected Load thread.
+                {
+                    float* beta_base = (float*)params.beta_ptr;
+                    for (int i = 0; i < T_TILE; ++i) {
+                        smem->beta_smem[buf_idx_A][i] =
+                            (i < sub_seq_len) ? beta_base[(token_offset + tile_idx * T_TILE + i) * params.h + head_idx]
+                                              : 0.0f;
+                    }
+                    fence_view_async_shared();
+                }
+
+                // Signal Prep/MMA: dA + beta ready.
+                cute::arrive_barrier(smem->bar_load_dA_ready[buf_idx_A]);
 
                 for (int k_idx = 0; k_idx < K_ITERATION; ++k_idx) {
-                    int cur_buf = k_idx % NUM_BUF;
+                    int local_phase = (state_phase >> buf_idx_value) & 1;
 
-                    // Wait for buffer to be free (from Prep epilogue).
-                    // First tile: buffers start free, so skip wait for ki < NUM_BUF.
-                    // Subsequent tiles: always wait (previous tile's last ki may still be in use).
-                    if (k_idx >= NUM_BUF || !first_tile) {
-                        cute::wait_barrier(smem->bar_buf_free[cur_buf], phase_free[cur_buf]);
-                        phase_free[cur_buf] ^= 1;
+                    // Wait when a value buffer slot wraps around and is reused.
+                    if (k_idx >= NUM_BUF) {
+                        cute::wait_barrier(smem->bar_buf_free[buf_idx_value], local_phase);
                     }
 
-                    // TMA load Q, K, G + dQ, dK, dG inter-chunk (single barrier)
+                    // TMA load Q, K, G + dQ, dK, dG inter-chunk.
                     {
-                        Tensor sQ = make_tensor(make_smem_ptr(smem->smem_q[cur_buf].data()), SmemLayoutInputBF16{});
-                        Tensor sK = make_tensor(make_smem_ptr(smem->smem_k[cur_buf].data()), SmemLayoutInputBF16{});
-                        Tensor sG = make_tensor(make_smem_ptr(smem->smem_g[cur_buf].data()), SmemLayoutInputFP32{});
+                        Tensor sQ = make_tensor(make_smem_ptr(smem->smem_q[buf_idx_value].data()), SmemLayoutInputBF16{});
+                        Tensor sK = make_tensor(make_smem_ptr(smem->smem_k[buf_idx_value].data()), SmemLayoutInputBF16{});
+                        Tensor sG = make_tensor(make_smem_ptr(smem->smem_g[buf_idx_value].data()), SmemLayoutInputFP32{});
                         Tensor sDQ =
-                            make_tensor(make_smem_ptr(smem->smem_dq_in[cur_buf].data()), SmemLayoutInputFP32{});
+                            make_tensor(make_smem_ptr(smem->smem_dq_in[buf_idx_value].data()), SmemLayoutInputFP32{});
                         Tensor sDK =
-                            make_tensor(make_smem_ptr(smem->smem_dk_in[cur_buf].data()), SmemLayoutInputFP32{});
+                            make_tensor(make_smem_ptr(smem->smem_dk_in[buf_idx_value].data()), SmemLayoutInputFP32{});
                         Tensor sDG =
-                            make_tensor(make_smem_ptr(smem->smem_dg_in[cur_buf].data()), SmemLayoutInputFP32{});
+                            make_tensor(make_smem_ptr(smem->smem_dg_in[buf_idx_value].data()), SmemLayoutInputFP32{});
 
                         int tma_bytes = sizeof(make_tensor_like(sQ)) + sizeof(make_tensor_like(sK)) +
                                         sizeof(make_tensor_like(sG)) + sizeof(make_tensor_like(sDQ)) +
@@ -343,90 +380,34 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
                         Tensor gDG = local_tile(
                             mDG(_, _, head_idx), make_shape(Int<T_TILE>{}, Int<K_TILE>{}), make_coord(tile_idx, k_idx));
 
-                        cute::set_barrier_transaction_bytes(smem->bar_qkg_ready[cur_buf], tma_bytes);
-                        launch_tma_copy(tma_params.tma_q, gQ, sQ, smem->bar_qkg_ready[cur_buf]);
-                        launch_tma_copy(tma_params.tma_k, gK, sK, smem->bar_qkg_ready[cur_buf]);
-                        launch_tma_copy(tma_params.tma_g, gG, sG, smem->bar_qkg_ready[cur_buf]);
-                        launch_tma_copy(tma_params.tma_dq, gDQ, sDQ, smem->bar_qkg_ready[cur_buf]);
-                        launch_tma_copy(tma_params.tma_dk, gDK, sDK, smem->bar_qkg_ready[cur_buf]);
-                        launch_tma_copy(tma_params.tma_dg, gDG, sDG, smem->bar_qkg_ready[cur_buf]);
+                        cute::set_barrier_transaction_bytes(smem->bar_load_qkg_ready[buf_idx_value], tma_bytes);
+                        launch_tma_copy(tma_params.tma_q, gQ, sQ, smem->bar_load_qkg_ready[buf_idx_value]);
+                        launch_tma_copy(tma_params.tma_k, gK, sK, smem->bar_load_qkg_ready[buf_idx_value]);
+                        launch_tma_copy(tma_params.tma_g, gG, sG, smem->bar_load_qkg_ready[buf_idx_value]);
+                        launch_tma_copy(tma_params.tma_dq, gDQ, sDQ, smem->bar_load_qkg_ready[buf_idx_value]);
+                        launch_tma_copy(tma_params.tma_dk, gDK, sDK, smem->bar_load_qkg_ready[buf_idx_value]);
+                        launch_tma_copy(tma_params.tma_dg, gDG, sDG, smem->bar_load_qkg_ready[buf_idx_value]);
                     }
-                }  // end per-ki TMA loads
-                first_tile = false;
-            }  // end persistent tile loop
+
+                    state_phase ^= 1 << buf_idx_value;
+                    buf_idx_value = (buf_idx_value + 1) % NUM_BUF;
+                }
+
+                state_phase ^= 1 << (buf_idx_A + NUM_BUF);
+                buf_idx_A = (buf_idx_A + 1) % NUM_BUF;
+                ++tile_counter;
+            }
         }
-
-        // ── Warp1: TMA load dAqk, dAkk + beta (once per tile) ──
-        if (warp_idx_in_wg == 1 && elect_one_sync()) {
-            bool first_tile_w1 = true;
-            for (; tile_scheduler.is_valid(); tile_scheduler.advance()) {
-                int tid = tile_scheduler.get_current_tile_id();
-
-                auto blk_coord = TileScheduler::decode_tile_coord(tid, params.h, chunk_indices_ptr, cu_len_ptr);
-                int batch_idx = get<0>(blk_coord);
-                int head_idx = get<1>(blk_coord);
-                int tile_idx = get<2>(blk_coord);
-                int token_offset = cu_len_ptr[batch_idx];
-
-                // Wait for previous tile's epilogue to finish before overwriting dA/beta
-                // (smem_daqk, smem_dakk, beta_smem are single-buffered)
-                if (!first_tile_w1) {
-                    cute::wait_barrier(smem->bar_epilogue_done, phase_epi);
-                    phase_epi ^= 1;
-                }
-
-                // TMA load dAqk, dAkk
-                {
-                    Tensor sDAqk = make_tensor(make_smem_ptr(smem->smem_daqk.data()), SmemLayoutDA{});
-                    Tensor sDAkk = make_tensor(make_smem_ptr(smem->smem_dakk.data()), SmemLayoutDA{});
-                    int tma_bytes_da = sizeof(make_tensor_like(sDAqk)) + sizeof(make_tensor_like(sDAkk));
-
-                    Tensor mDaqk = domain_offset(
-                        make_coord(token_offset, _0{}, _0{}), tma_params.tma_dAqk.get_tma_tensor(tma_params.shape_da));
-                    Tensor mDakk = domain_offset(
-                        make_coord(token_offset, _0{}, _0{}), tma_params.tma_dAkk.get_tma_tensor(tma_params.shape_da));
-                    Tensor gDaqk = local_tile(
-                        mDaqk(_, _, head_idx), make_shape(Int<T_TILE>{}, Int<T_TILE>{}), make_coord(tile_idx, _0{}));
-                    Tensor gDakk = local_tile(
-                        mDakk(_, _, head_idx), make_shape(Int<T_TILE>{}, Int<T_TILE>{}), make_coord(tile_idx, _0{}));
-
-                    cute::set_barrier_transaction_bytes(smem->bar_dA_ready, tma_bytes_da);
-                    launch_tma_copy(tma_params.tma_dAqk, gDaqk, sDAqk, smem->bar_dA_ready);
-                    launch_tma_copy(tma_params.tma_dAkk, gDakk, sDAkk, smem->bar_dA_ready);
-                }
-
-                // Load beta (scalar, via elected thread direct global load)
-                {
-                    int seq_len = cu_len_ptr[batch_idx + 1] - cu_len_ptr[batch_idx];
-                    int sub_seq_len = min(T_TILE, seq_len - tile_idx * T_TILE);
-                    float* beta_base = (float*)params.beta_ptr;
-                    for (int i = 0; i < T_TILE; ++i) {
-                        smem->beta_smem[i] =
-                            (i < sub_seq_len) ? beta_base[(token_offset + tile_idx * T_TILE + i) * params.h + head_idx]
-                                              : 0.0f;
-                    }
-                    fence_view_async_shared();
-                }
-
-                // Signal Prep: dA + beta ready (pairs with bar_dA_ready arrival count = 2)
-                cute::arrive_barrier(smem->bar_dA_ready);
-
-                first_tile_w1 = false;
-            }  // end persistent tile loop
-        }
-
-        // Warp2: idle
-        // Warp3: Phase 4 TMA store dB
 
         // =================================================================
-        // WG1: MMA — mma.sync 4-pass sub-chunk loop
+        // MMA warpgroup — mma.sync 4-pass sub-chunk loop
         // =================================================================
     } else if (role == WGRole::MMA) {
         cutlass::arch::warpgroup_reg_alloc<REG_MMA>();
 
-        // Thread mapping within WG1 (128 threads = 4 warps)
-        const int warp_id = idx_in_wg / 32;  // 0..3, each warp handles N=8 cols
-        const int lane_id = idx_in_wg % 32;
+        // Thread mapping within MMA warpgroup (128 threads = 4 warps)
+        const int warp_id = thread_idx / 32;      // 0..3, each warp handles N=8 cols
+        const int lane_id = idx_in_warp;
         const int group_id = lane_id / 4;       // 0..7 (row within 16-row tile)
         const int lane_in_group = lane_id % 4;  // 0..3 (K-stride)
 
@@ -755,13 +736,13 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
         }
 
         // =================================================================
-        // WG2 & WG3: Prep — scalar computation (Phase 1: skeleton)
+        // Prep warpgroups — scalar computation
         // =================================================================
     } else {
         cutlass::arch::warpgroup_reg_alloc<REG_PREP>();
 
         // Prep thread ID within the 256-thread Prep group
-        int prep_tid = thread_idx - 256;  // [0, 255]
+        int prep_tid = thread_idx - PREP_THREAD_OFFSET;  // [0, 255]
 
         for (; tile_scheduler.is_valid(); tile_scheduler.advance()) {
             int tid = tile_scheduler.get_current_tile_id();
@@ -1076,3 +1057,11 @@ run_kda_bwd_intra_sm90(KDA_bwd_intra_params& params, cudaStream_t stream) {
 }
 
 }  // namespace sm90_bwd
+
+// =====================================================================
+// C API — exposed for standalone compilation / FFI
+// =====================================================================
+extern "C" void
+launch_c_kda_bwd_intra_sm90(void* params, cudaStream_t stream) {
+    sm90_bwd::run_kda_bwd_intra_sm90(*static_cast<KDA_bwd_intra_params*>(params), stream);
+}

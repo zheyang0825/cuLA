@@ -19,3 +19,16 @@ from cula.ops.lightning_attn import LinearAttentionChunkwiseDecay
 __all__ = [
     "LinearAttentionChunkwiseDecay",
 ]
+
+# ------------------------------------------------------------------
+# Monkey-patch backward-intra SM90 standalone extension into the
+# main cula.cudac namespace so existing imports keep working.
+# ------------------------------------------------------------------
+try:
+    import cula.cudac as _cudac
+    import cula._kda_bwd_intra_sm90 as _bwd_ext
+
+    _cudac.chunk_kda_bwd_intra_sm90 = _bwd_ext.chunk_kda_bwd_intra_sm90
+except Exception:
+    # Either extension is not built yet or SM90 is disabled; ignore
+    pass

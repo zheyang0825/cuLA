@@ -65,30 +65,6 @@ kda_fwd_prefill(
     torch::Tensor workspace_buffer,
     float scale,
     bool safe_gate);
-
-void
-ChunkKDABwdIntraSm90(
-    at::Tensor q,
-    at::Tensor k,
-    at::Tensor g,
-    at::Tensor beta,
-    at::Tensor dAqk,
-    at::Tensor dAkk,
-    at::Tensor dq,
-    at::Tensor dk,
-    at::Tensor db,
-    at::Tensor dg,
-    at::Tensor cu_seqlens,
-    at::Tensor chunk_indices,
-    at::Tensor dq_out,
-    at::Tensor dk_out,
-    at::Tensor db_out,
-    at::Tensor dg_out,
-    at::Tensor tile_counter,
-    int chunk_size,
-    std::optional<at::Tensor> debug_kg,
-    std::optional<at::Tensor> debug_qg,
-    std::optional<at::Tensor> debug_kbg);
 #endif
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -99,29 +75,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 #endif
 #if defined(CULA_SM90A_ENABLED)
     m.def("kda_fwd_prefill", &kda_fwd_prefill);
-    m.def(
-        "chunk_kda_bwd_intra_sm90",
-        &ChunkKDABwdIntraSm90,
-        py::arg("q"),
-        py::arg("k"),
-        py::arg("g"),
-        py::arg("beta"),
-        py::arg("dAqk"),
-        py::arg("dAkk"),
-        py::arg("dq"),
-        py::arg("dk"),
-        py::arg("db"),
-        py::arg("dg"),
-        py::arg("cu_seqlens"),
-        py::arg("chunk_indices"),
-        py::arg("dq_out"),
-        py::arg("dk_out"),
-        py::arg("db_out"),
-        py::arg("dg_out"),
-        py::arg("tile_counter"),
-        py::arg("chunk_size"),
-        py::arg("debug_kg") = py::none(),
-        py::arg("debug_qg") = py::none(),
-        py::arg("debug_kbg") = py::none());
 #endif
 }

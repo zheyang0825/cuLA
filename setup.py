@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -75,8 +76,6 @@ DISABLE_SM90 = resolve_disable_flag("CULA_DISABLE_SM90", _has_sm90)
 
 def get_nvcc_version() -> tuple[int, int]:
     """Return the NVCC (major, minor) version tuple, e.g. ``(12, 9)``."""
-    # NOTE The "CUDA_HOME" here is not necessarily from the `CUDA_HOME` environment variable.
-    # For more details, see `torch/utils/cpp_extension.py`
     assert CUDA_HOME is not None, "PyTorch must be compiled with CUDA support"
     nvcc_version = subprocess.check_output(
         [os.path.join(CUDA_HOME, "bin", "nvcc"), "--version"], stderr=subprocess.STDOUT
@@ -87,22 +86,12 @@ def get_nvcc_version() -> tuple[int, int]:
 
 
 def nvcc_supports_blackwell() -> bool:
-    """Return ``True`` if the current NVCC version is >= 12.9, which is
-    required for compiling SM100/SM103 (Blackwell) kernels.
-
-    This is a **build-time** utility.  For runtime Blackwell device checks,
-    see :func:`cula.utils.is_blackwell` and :func:`cula.utils.assert_blackwell`.
-    """
+    """Return ``True`` if the current NVCC version is >= 12.9."""
     major, minor = get_nvcc_version()
     return major > 12 or (major == 12 and minor >= 9)
 
 
 def assert_blackwell_build_env() -> None:
-    """Assert that the build environment can compile Blackwell (SM100/SM103) kernels.
-
-    Raises ``AssertionError`` when NVCC < 12.9 and Blackwell targets have not
-    been explicitly disabled via ``CULA_DISABLE_SM100`` / ``CULA_DISABLE_SM103``.
-    """
     if not nvcc_supports_blackwell():
         assert DISABLE_SM100 and DISABLE_SM103, (
             "sm100/sm103 compilation requires NVCC 12.9 or higher. "
@@ -115,7 +104,6 @@ def get_arch_flags():
     major, minor = get_nvcc_version()
     print(f"Compiling using NVCC {major}.{minor}")
 
-    # Validate Blackwell build environment
     assert_blackwell_build_env()
 
     arch_flags = []
@@ -136,15 +124,39 @@ def get_nvcc_thread_args():
     return ["--threads", nvcc_threads]
 
 
-subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
-
+# =====================================================================
+# ccache setup — wrap NVCC so that unchanged .cu files compile instantly
+# =====================================================================
 this_dir = os.path.dirname(os.path.abspath(__file__))
+
+ccache_path = shutil.which("ccache")
+if ccache_path and os.environ.get("CULA_DISABLE_CCACHE", "0") != "1":
+    nvcc_real = os.path.join(CUDA_HOME, "bin", "nvcc")
+    ccache_wrapper = os.path.join(this_dir, "scripts", "nvcc-ccache")
+    os.makedirs(os.path.dirname(ccache_wrapper), exist_ok=True)
+    with open(ccache_wrapper, "w") as f:
+        f.write(f'#!/bin/bash\nexec "{ccache_path}" "{nvcc_real}" "${{@}}"\n')
+    os.chmod(ccache_wrapper, 0o755)
+
+    os.environ.setdefault("PYTORCH_NVCC", ccache_wrapper)
+    os.environ.setdefault("TORCH_EXTENSION_SKIP_NVCC_GEN_DEPENDENCIES", "1")
+    os.environ.setdefault("CCACHE_NOHASHDIR", "1")
+    print(f"  ccache enabled for NVCC: {ccache_wrapper}")
+else:
+    print("  ccache not enabled (install ccache or set CULA_DISABLE_CCACHE=0)")
+
+
+subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
 
 if IS_WINDOWS:
     cxx_args = ["/O2", "/std:c++20", "/DNDEBUG", "/W0"]
 else:
     cxx_args = ["-O3", "-std=c++20", "-DNDEBUG", "-Wno-deprecated-declarations"]
 
+
+# =====================================================================
+# Main extension: everything except the standalone backward-intra kernel
+# =====================================================================
 cuda_sources = [
     "csrc/api/pybind.cu",
 ]
@@ -159,12 +171,40 @@ if not DISABLE_SM90:
     cuda_sources.extend(
         [
             "csrc/api/kda_sm90.cu",
-            "csrc/api/kda_bwd_sm90.cu",
             "csrc/kda/sm90/kda_fwd_sm90.cu",
             "csrc/kda/sm90/kda_fwd_sm90_safe_gate.cu",
-            "csrc/kda/sm90/bwd/kda_bwd_intra_sm90.cu",
+            # NOTE: backward intra is now in its own extension for faster iteration
         ]
     )
+
+common_nvcc_flags = (
+    [
+        "-O3",
+        "-std=c++20",
+        "-DNDEBUG",
+        "-Wno-deprecated-declarations",
+        "-U__CUDA_NO_HALF_OPERATORS__",
+        "-U__CUDA_NO_HALF_CONVERSIONS__",
+        "-U__CUDA_NO_HALF2_OPERATORS__",
+        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+        "--expt-relaxed-constexpr",
+        "--expt-extended-lambda",
+        "-lineinfo",
+        "--ptxas-options=--verbose,--register-usage-level=10,--warn-on-local-memory-usage",
+        "-diag-suppress=3189",
+    ]
+    + get_features_args()
+    + get_arch_flags()
+    + get_nvcc_thread_args()
+    + (["--use_fast_math"] if USE_FAST_MATH else [])
+)
+
+common_include_dirs = [
+    Path(this_dir) / "csrc",
+    Path(this_dir) / "csrc" / "kerutils" / "include",
+    Path(this_dir) / "csrc" / "cutlass" / "include",
+    Path(this_dir) / "csrc" / "cutlass" / "tools" / "util" / "include",
+]
 
 ext_modules = []
 ext_modules.append(
@@ -173,35 +213,30 @@ ext_modules.append(
         sources=cuda_sources,
         extra_compile_args={
             "cxx": cxx_args + get_features_args(),
-            "nvcc": [
-                "-O3",
-                "-std=c++20",
-                "-DNDEBUG",
-                # "-D_USE_MATH_DEFINES",
-                "-Wno-deprecated-declarations",
-                "-U__CUDA_NO_HALF_OPERATORS__",
-                "-U__CUDA_NO_HALF_CONVERSIONS__",
-                "-U__CUDA_NO_HALF2_OPERATORS__",
-                "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-                "--expt-relaxed-constexpr",
-                "--expt-extended-lambda",
-                "-lineinfo",
-                "--ptxas-options=--verbose,--register-usage-level=10,--warn-on-local-memory-usage",
-                "-diag-suppress=3189",  # suppress the warning of torch in C++ 20
-            ]
-            + get_features_args()
-            + get_arch_flags()
-            + get_nvcc_thread_args()
-            + (["--use_fast_math"] if USE_FAST_MATH else []),
+            "nvcc": common_nvcc_flags,
         },
-        include_dirs=[
-            Path(this_dir) / "csrc",
-            Path(this_dir) / "csrc" / "kerutils" / "include",
-            Path(this_dir) / "csrc" / "cutlass" / "include",
-            Path(this_dir) / "csrc" / "cutlass" / "tools" / "util" / "include",
-        ],
+        include_dirs=common_include_dirs,
     )
 )
+
+# =====================================================================
+# Standalone extension: SM90 backward intra (fast iteration)
+# =====================================================================
+if not DISABLE_SM90:
+    ext_modules.append(
+        CUDAExtension(
+            name="cula._kda_bwd_intra_sm90",
+            sources=[
+                "csrc/api/kda_bwd_sm90_standalone.cu",
+                "csrc/kda/sm90/bwd/kda_bwd_intra_sm90.cu",
+            ],
+            extra_compile_args={
+                "cxx": cxx_args + get_features_args(),
+                "nvcc": common_nvcc_flags,
+            },
+            include_dirs=common_include_dirs,
+        )
+    )
 
 setup(
     name="cuda-linear-attention",

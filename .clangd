@@ -1,0 +1,27 @@
+CompileFlags:
+  Add:
+    - -std=c++17
+    - -I/home/yangzhe/cuLA/csrc/cutlass/include
+    - -I/home/yangzhe/cuLA/csrc/cutlass/tools/util/include
+    - -I/home/yangzhe/cuLA/csrc/kerutils/include
+    - -I/usr/local/cuda/include
+    - -xcuda
+    - --cuda-path=/usr/local/cuda
+    - --no-cuda-version-check
+    - -D__CUDACC__
+    - -D__CUDA_ARCH__=800
+    - -DCUTE_ARCH_TMA_SM90_ENABLED
+    - -DCUTE_ARCH_TMA_SM100_ENABLED
+    - -DCUTLASS_ARCH_MMA_SM90_ENABLED
+    - -DCUTLASS_ARCH_MMA_SM100_ENABLED
+    - -DTHRUST_DEVICE_SYSTEM=THRUST_DEVICE_SYSTEM_CUDA
+  Remove:
+    - -Xcompiler
+    - -Xlinker
+    - -forward-unknown-to-host-compiler
+    - --generate-code*
+    - -gencode*
+    - -arch*
+    - -code*
+    - --cuda-gpu-arch*
+    - -mno-direct-store-extern
