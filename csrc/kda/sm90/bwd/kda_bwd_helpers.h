@@ -9,49 +9,31 @@ namespace sm90_bwd {
 using namespace cute;
 
 // =====================================================================
-// float2 operations — direct copy from SM100
+// float2 operations — SM90-compatible (componentwise scalar ops)
 // =====================================================================
 
 CUTE_DEVICE
 float2
 float2_add(const float2& a, const float2& b) {
-    float2 c;
-    asm volatile("add.f32x2 %0, %1, %2;\n"
-                 : "=l"(reinterpret_cast<uint64_t&>(c))
-                 : "l"(reinterpret_cast<uint64_t const&>(a)), "l"(reinterpret_cast<uint64_t const&>(b)));
-    return c;
+    return make_float2(a.x + b.x, a.y + b.y);
 }
 
 CUTE_DEVICE
 float2
 float2_sub(const float2& a, const float2& b) {
-    float2 c;
-    asm volatile("sub.f32x2 %0, %1, %2;\n"
-                 : "=l"(reinterpret_cast<uint64_t&>(c))
-                 : "l"(reinterpret_cast<uint64_t const&>(a)), "l"(reinterpret_cast<uint64_t const&>(b)));
-    return c;
+    return make_float2(a.x - b.x, a.y - b.y);
 }
 
 CUTE_DEVICE
 float2
 float2_mul(const float2& a, const float2& b) {
-    float2 c;
-    asm volatile("mul.f32x2 %0, %1, %2;\n"
-                 : "=l"(reinterpret_cast<uint64_t&>(c))
-                 : "l"(reinterpret_cast<uint64_t const&>(a)), "l"(reinterpret_cast<uint64_t const&>(b)));
-    return c;
+    return make_float2(a.x * b.x, a.y * b.y);
 }
 
 CUTE_DEVICE
 float2
 float2_fma(const float2& a, const float2& b, const float2& c) {
-    float2 d;
-    asm volatile("fma.rn.f32x2 %0, %1, %2, %3;\n"
-                 : "=l"(reinterpret_cast<uint64_t&>(d))
-                 : "l"(reinterpret_cast<uint64_t const&>(a)),
-                   "l"(reinterpret_cast<uint64_t const&>(b)),
-                   "l"(reinterpret_cast<uint64_t const&>(c)));
-    return d;
+    return make_float2(fmaf(a.x, b.x, c.x), fmaf(a.y, b.y, c.y));
 }
 
 CUTE_DEVICE
@@ -80,16 +62,13 @@ _store_256B(
     uint32_t const& src6,
     uint32_t const& src7,
     void* gmem_addr) {
+    // SM90: split into two 128-bit stores (sm_100 v8.f32 not available).
     asm volatile(
-        "st.global.L1::no_allocate.v8.f32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};\n" ::"l"(gmem_addr),
-        "r"(src0),
-        "r"(src1),
-        "r"(src2),
-        "r"(src3),
-        "r"(src4),
-        "r"(src5),
-        "r"(src6),
-        "r"(src7));
+        "st.global.L1::no_allocate.v4.f32 [%0], {%1, %2, %3, %4};\n" ::"l"(gmem_addr),
+        "r"(src0), "r"(src1), "r"(src2), "r"(src3));
+    asm volatile(
+        "st.global.L1::no_allocate.v4.f32 [%0], {%1, %2, %3, %4};\n" ::"l"((char*)gmem_addr + 16),
+        "r"(src4), "r"(src5), "r"(src6), "r"(src7));
 }
 
 CUTE_DEVICE
