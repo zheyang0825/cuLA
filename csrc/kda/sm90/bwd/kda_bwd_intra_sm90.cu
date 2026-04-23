@@ -35,7 +35,8 @@ constexpr int T_TILE = 64;                    // chunk size (tokens per tile)
 constexpr int K_SIZE = 128;                   // head dimension
 constexpr int K_TILE = 32;                    // per-ki tile width
 constexpr int K_ITERATION = K_SIZE / K_TILE;  // = 4
-constexpr int NUM_BUF = 1;                    // single buffer (SMEM-limited)
+constexpr int NUM_BUF = 2;                      // value buffers (Q/K/G/dQ/dK/dG): double-buffered
+constexpr int NUM_BUF_A = 1;                    // dA/beta buffers: single-buffered (SMEM-limited)
 constexpr int NUM_MMA_THREADS = 128;
 constexpr int NUM_PREP_THREADS = 256;
 constexpr int NUM_LOAD_THREADS = 32;
@@ -138,8 +139,8 @@ struct SharedStorage {
     array_aligned<float, cosize_v<SmemLayoutInputFP32>> smem_g[NUM_BUF];  // 2 × 8 KB = 16 KB
 
     // dAqk, dAkk: loaded once per tile (double-buffered across tiles)
-    array_aligned<float, cosize_v<SmemLayoutDA>> smem_daqk[NUM_BUF];  // 16 KB
-    array_aligned<float, cosize_v<SmemLayoutDA>> smem_dakk[NUM_BUF];  // 16 KB
+    array_aligned<float, cosize_v<SmemLayoutDA>> smem_daqk[NUM_BUF_A];  // 16 KB
+    array_aligned<float, cosize_v<SmemLayoutDA>> smem_dakk[NUM_BUF_A];  // 16 KB
 
     // dQ, dK, dG inter-chunk input (double-buffered per ki)
     array_aligned<float, cosize_v<SmemLayoutInputFP32>> smem_dq_in[NUM_BUF];  // 2 × 8 KB = 16 KB
@@ -159,7 +160,7 @@ struct SharedStorage {
     } qkg_all; // 40960 bytes, single-buffered
 
     // Scalar data
-    array_aligned<float, T_TILE> beta_smem[NUM_BUF];  // double-buffered with dA
+    array_aligned<float, T_TILE> beta_smem[NUM_BUF_A];  // single-buffered with dA
     array_aligned<float, T_TILE> db_accum;   // 256 B (cross-ki dB accumulator)
 
     // ── MMA-result scratch: dQ, dQ2 (also reused as DKT exchange pair). dKt
@@ -177,7 +178,7 @@ struct SharedStorage {
     // ── Pipeline barriers ──
     // Load → consumers
     alignas(16) cute::uint64_t bar_load_qkg_ready[NUM_BUF];
-    alignas(16) cute::uint64_t bar_load_dA_ready[NUM_BUF];
+    alignas(16) cute::uint64_t bar_load_dA_ready[NUM_BUF_A];
 
     // Prep → MMA
     alignas(16) cute::uint64_t bar_kg_all_ready, bar_qkg_all_ready;
@@ -189,7 +190,7 @@ struct SharedStorage {
     alignas(16) cute::uint64_t bar_prep_dq_consumed;
 
     // Prep → Load
-    alignas(16) cute::uint64_t bar_dA_free[NUM_BUF];
+    alignas(16) cute::uint64_t bar_dA_free[NUM_BUF_A];
     alignas(16) cute::uint64_t bar_buf_free[NUM_BUF];  // value-buffer free signal
 };
 
@@ -591,7 +592,7 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
         for (int i = 0; i < NUM_BUF; ++i) {
             cute::initialize_barrier(smem->bar_load_qkg_ready[i], 1);
         }
-        for (int i = 0; i < NUM_BUF; ++i) {
+        for (int i = 0; i < NUM_BUF_A; ++i) {
             cute::initialize_barrier(smem->bar_load_dA_ready[i], 2);  // TMA + elected Load thread
         }
 
@@ -609,8 +610,10 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
         // (returns when they differ).  Free-bar consumers (LdSt) use
         // wait(local_phase ^ 1): first iter wait(1) on fresh bar (parity 0)
         // returns immediately, signalling buffer is initially free.
-        for (int i = 0; i < NUM_BUF; ++i) {
+        for (int i = 0; i < NUM_BUF_A; ++i) {
             cute::initialize_barrier(smem->bar_dA_free[i], 256);
+        }
+        for (int i = 0; i < NUM_BUF; ++i) {
             cute::initialize_barrier(smem->bar_buf_free[i], 256);
         }
         cutlass::arch::fence_barrier_init();
@@ -755,7 +758,7 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
                 }
 
                 state_phase ^= 1 << (buf_idx_A + NUM_BUF);
-                buf_idx_A = (buf_idx_A + 1) % NUM_BUF;
+                buf_idx_A = (buf_idx_A + 1) % NUM_BUF_A;
 #if KDA_BWD_SM90_DEBUG_PRINT
                 if (blockIdx.x == 0) printf("[LDST] tile complete\n");
 #endif
@@ -1056,7 +1059,7 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
             }
 
             state_phase ^= 1 << (buf_idx_A + NUM_BUF);
-            buf_idx_A = (buf_idx_A + 1) % NUM_BUF;
+            buf_idx_A = (buf_idx_A + 1) % NUM_BUF_A;
 
 #if KDA_BWD_SM90_DEBUG_PRINT
             if (blockIdx.x == 0 && thread_idx == 0) printf("[MMA] tile_idx=%d done\n", tile_idx);
@@ -1120,7 +1123,7 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
 
             cute::arrive_barrier(smem->bar_dA_free[buf_idx_A]);
             state_phase ^= 1 << (buf_idx_A + NUM_BUF);
-            buf_idx_A = (buf_idx_A + 1) % NUM_BUF;
+            buf_idx_A = (buf_idx_A + 1) % NUM_BUF_A;
         }
     }
 }
