@@ -16,9 +16,14 @@ ncu gui report 顺便也生成到当前目录下，方便我查看
 过程中，你如果不是遇到非常严重的问题，禁止停下来问我，我希望你一次性完成这个任务。 过程中，你如果不是遇到非常严重的问题，禁止停下来问我，我希望你一次性完成这个任务。过程中，你如果不是遇到非常严重的问题，禁止停下来问我，我希望你一次性完成这个任务。
 如果我有insight ，会在这个文档更新，你定期看看。
 
-  source .venv/bin/activate && CUDA_VISIBLE_DEVICES=7 sudo -E env "PATH=$PATH" $(which ncu) --kernel-name "regex:.*kda_bwd_intra_sm90.*" --launch-skip 3           
-  --launch-count 1 --set full -o bwd_intra2 python scripts/ncu_bwd_intra_sm90.py --B 4 --T 2048 --H 4 --D 128 
+  source .venv/bin/activate && CUDA_VISIBLE_DEVICES=7 sudo -E env "PATH=$PATH" $(which ncu) --kernel-name "regex:.*kda_bwd_intra_sm90.*" --launch-skip 3  \
+  --launch-count 1 --set full -o bwdddd python scripts/ncu_bwd_intra_sm90.py --B 4 --T 2048 --H 4 --D 128 
 
+  ncu -i bwdddd.ncu-rep --section SpeedOfLight --csv 
+  ncu -i bwdddd.ncu-rep --section MemoryWorkloadAnalysis --csv
+  ncu -i bwdddd.ncu-rep --section Occupancy --csv   
+  ncu -i bwdddd.ncu-rep --section SchedulerStatistics --csv
+  
 之前的结论：
 两轮优化后报告：
 当前状态: commit 6ae1cb7 (已push), 从 0.20x -> 0.22x FLA (+10%)
