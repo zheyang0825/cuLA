@@ -39,14 +39,15 @@ constexpr int NUM_BUF = 2;                      // value buffers (Q/K/G/dQ/dK/dG
 constexpr int NUM_BUF_A = 1;                    // dA/beta buffers: single-buffered (SMEM-limited)
 constexpr int NUM_MMA_THREADS = 128;
 constexpr int NUM_PREP_THREADS = 256;
-constexpr int NUM_LOAD_THREADS = 32;
+constexpr int NUM_LOAD_THREADS = 128;          // padded to full warpgroup for setmaxnreg
 constexpr int MMA_THREAD_OFFSET = 0;
 constexpr int PREP_THREAD_OFFSET = MMA_THREAD_OFFSET + NUM_MMA_THREADS;
 constexpr int LOAD_THREAD_OFFSET = PREP_THREAD_OFFSET + NUM_PREP_THREADS;
-constexpr int NUM_THREADS = NUM_MMA_THREADS + NUM_PREP_THREADS + NUM_LOAD_THREADS;
+constexpr int NUM_THREADS = NUM_MMA_THREADS + NUM_PREP_THREADS + NUM_LOAD_THREADS;  // = 512
 constexpr int NUM_MMA_WARPS = NUM_MMA_THREADS / 32;
 constexpr int NUM_PREP_WARPS = NUM_PREP_THREADS / 32;
-constexpr int LOAD_WARP_IDX = NUM_MMA_WARPS + NUM_PREP_WARPS;
+constexpr int NUM_LOAD_WARPS = NUM_LOAD_THREADS / 32;
+constexpr int LOAD_WARP_IDX = NUM_MMA_WARPS + NUM_PREP_WARPS;  // first warp of LdSt WG
 constexpr int CHUNK_SIZE = 64;
 
 // Clamped exp2f to prevent inf/NaN from large gate differences across sub-tiles
@@ -55,10 +56,14 @@ safe_exp2f(float x) {
     return exp2f(fminf(fmaxf(x, -126.0f), 126.0f));
 }
 
-// Register allocation
-constexpr int REG_LDST = 24;   // LdSt: minimal registers
-constexpr int REG_MMA = 168;   // MMA: fragment-heavy
-constexpr int REG_PREP = 160;  // Prep: scalar computation
+// Register allocation per warpgroup (sum * 128 must fit 64K reg/CTA budget):
+// LdSt WG: deallocate to release regs for compute.
+// MMA WG : largest budget — fragment-heavy.
+// Prep WG×2: scalar-heavy but moderate live set.
+// Constraint: 24 + REG_MMA + 2*REG_PREP <= 512.
+constexpr int REG_LDST = 24;
+constexpr int REG_MMA  = 192;
+constexpr int REG_PREP = 144;
 
 // MMA atom alias
 using MMA_TF32 = cute::SM80_16x8x8_F32TF32TF32F32_TN;
@@ -636,7 +641,8 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
     // Load warp — TMA loads + writes
     // =================================================================
     if (role == WGRole::LdSt) {
-        if (elect_one_sync()) {
+        cutlass::arch::warpgroup_reg_dealloc<REG_LDST>();
+        if (warp_idx == LOAD_WARP_IDX && elect_one_sync()) {
             for (; tile_scheduler.is_valid(); tile_scheduler.advance()) {
                 int A_phase = (state_phase >> (buf_idx_A + NUM_BUF)) & 1;
 #if KDA_BWD_SM90_DEBUG_PRINT
@@ -772,7 +778,7 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
         // MMA warpgroup — mma.sync 4-pass sub-chunk loop
         // =================================================================
     } else if (role == WGRole::MMA) {
-        // cutlass::arch::warpgroup_reg_alloc<REG_MMA>();  // optional; enable once stable
+        cutlass::arch::warpgroup_reg_alloc<REG_MMA>();
 
         const int warp_id_in_wg = thread_idx / 32;   // 0..3 — selects query-block M=[16*w, 16*(w+1))
         const int lane_id = thread_idx % 32;
@@ -1070,7 +1076,7 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
         // Prep warpgroups — scalar B-operand setup + epilogue
         // =================================================================
     } else {
-        // cutlass::arch::warpgroup_reg_alloc<REG_PREP>();
+        cutlass::arch::warpgroup_reg_alloc<REG_PREP>();
 
         const int prep_thread = thread_idx - PREP_THREAD_OFFSET;  // 0..255
         const int prep_wg_idx = prep_thread / 128;                // 0 or 1
