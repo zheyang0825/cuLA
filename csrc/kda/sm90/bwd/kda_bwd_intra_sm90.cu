@@ -147,6 +147,13 @@ struct SharedStorage {
     array_aligned<float, cosize_v<SmemLayoutDA>> smem_daqk[NUM_BUF_A];  // 16 KB
     array_aligned<float, cosize_v<SmemLayoutDA>> smem_dakk[NUM_BUF_A];  // 16 KB
 
+    // Pre-transposed dAqk for QKG phase: dAqk_T(j, i) = dAqk(i, j).
+    // Eliminates scalar transposed gather for the dAqk half of A operand —
+    // enables vectorized partition_A loads via the same SmemLayoutDA layout.
+    // (dAkk stays scalar-gathered; allocating both transposed buffers would
+    //  exceed SMEM budget without sacrificing NUM_BUF=2 pipeline overlap.)
+    array_aligned<float, cosize_v<SmemLayoutDA>> smem_daqk_T[NUM_BUF_A];  // 16 KB
+
     // dQ, dK, dG inter-chunk input (double-buffered per ki)
     array_aligned<float, cosize_v<SmemLayoutInputFP32>> smem_dq_in[NUM_BUF];  // 2 × 8 KB = 16 KB
     array_aligned<float, cosize_v<SmemLayoutInputFP32>> smem_dk_in[NUM_BUF];  // 2 × 8 KB = 16 KB
@@ -823,6 +830,20 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
 
             Tensor sDAqk = make_tensor(make_smem_ptr(smem->smem_daqk[buf_idx_A].data()), SmemLayoutDA{});
             Tensor sDAkk = make_tensor(make_smem_ptr(smem->smem_dakk[buf_idx_A].data()), SmemLayoutDA{});
+            Tensor sDAqk_T = make_tensor(make_smem_ptr(smem->smem_daqk_T[buf_idx_A].data()), SmemLayoutDA{});
+
+            // ── Cooperative transpose: sDAqk(r, c) -> sDAqk_T(c, r) ──
+            // 128 MMA threads, 4096 elements = 32 elements/thread.
+            // (Only dAqk is pre-transposed; dAkk stays scalar-gathered to fit SMEM budget.)
+            CUTE_UNROLL
+            for (int idx = thread_idx; idx < T_TILE * T_TILE; idx += NUM_MMA_THREADS) {
+                int r = idx / T_TILE;
+                int c = idx % T_TILE;
+                sDAqk_T(c, r) = sDAqk(r, c);
+            }
+            fence_view_async_shared();
+            // MMA-only sync (id=10 unused elsewhere). 128 threads.
+            NamedBarrier::arrive_and_wait(NUM_MMA_THREADS, /*DA_T_BAR_ID=*/10);
 
             int b_phase = 0;
 
@@ -963,13 +984,11 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
                 clear(tDKT_intra_acc);
                 clear(tDKT_inter_acc);
 
-                // A layout for dKt MMA: (M=16, K=32) where K=[dAqk^T 16 rows | dAkk^T 16 rows].
-                // We build A by manual scalar SMEM read using identity-tensor coordinates,
-                // because dAqk/dAkk must be transposed and stacked — no simple local_tile view.
-                using AShape = Shape<_16, Int<2 * SUB_T_TILE>>;
-                // Build a "dummy" smem-backed tensor solely to let partition_fragment_A
-                // derive the per-thread register layout. We fill values manually below.
-                auto sA_proto = local_tile(sDAqk, Shape<_16, Int<2 * SUB_T_TILE>>{}, make_coord(0, 0));
+                // QKG A operand: dA_T(j, i) — j is the 16 "rows" (M dim of mma),
+                // i is the 16 "cols" (K dim of mma). Original A was 16x32 = [dAqk^T | dAkk^T].
+                // Split into two partial 16x16 K=16 gemms summing into the same C accumulator,
+                // splitting B's 32-K dim into two 16-K halves. dAqk reads use vectorized
+                // partition_A on transposed buffer; dAkk still uses scalar gather.
 
                 // ---- QKG intra: 6 strict-off-diagonal (i, j) pairs (i > j) ----
                 CUTE_UNROLL
@@ -978,34 +997,49 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
                     int i_block = qkg_intra_i[s];
                     int j_block = qkg_intra_j[s];
 
-                    auto cA   = make_identity_tensor(AShape{});
+                    // dAqk fragment via vectorized partition_A on transposed buffer.
+                    auto sA_qk = local_tile(sDAqk_T, Shape<_16, _16>{}, make_coord(j_block, i_block));
+                    auto tAsA_qk = thr_mma.partition_A(sA_qk);
+                    auto tArA_qk = make_fragment_like(tAsA_qk);
+                    cute::copy(tAsA_qk, tArA_qk);
+
+                    // dAkk fragment via scalar gather (no transposed buffer).
+                    auto tArA_kk = make_fragment_like(tAsA_qk);
+
+                    auto cA = make_identity_tensor(Shape<_16, _16>{});
                     auto tAcA = thr_mma.partition_A(cA);
-                    auto tArA = thr_mma.partition_fragment_A(sA_proto);
                     CUTE_UNROLL
-                    for (int i = 0; i < size(tArA); ++i) {
+                    for (int i = 0; i < size(tArA_qk); ++i) {
                         int r = get<0>(tAcA(i));
                         int c = get<1>(tAcA(i));
                         int g_j = j_block * 16 + r;
-                        int g_i;
-                        float v;
-                        if (c < 16) {
-                            g_i = i_block * 16 + c;
-                            v   = sDAqk(g_i, g_j);
-                        } else {
-                            g_i = i_block * 16 + (c - 16);
-                            v   = sDAkk(g_i, g_j);
-                        }
+                        int g_i = i_block * 16 + c;
                         bool keep = (g_i < sub_seq_len) && (g_j < sub_seq_len);
-                        tArA(i) = keep ? tfloat32_t(v) : tfloat32_t(0.0f);
+                        if (!keep) {
+                            tArA_qk(i) = tfloat32_t(0.0f);
+                            tArA_kk(i) = tfloat32_t(0.0f);
+                        } else {
+                            tArA_kk(i) = tfloat32_t(sDAkk(g_i, g_j));
+                        }
                     }
 
                     Tensor sB = make_tensor(make_smem_ptr(smem->qkg_all.intra[s].data()),
                                             SmemLayoutMatBTF32Tranposed<2>{});
-                    auto tBsB = thr_mma.partition_B(sB);
-                    auto tBrB = thr_mma.partition_fragment_B(sB);
-                    cute::copy(tBsB, tBrB);
+                    auto sB_lo = local_tile(sB, Shape<_32, _16>{}, make_coord(0, 0));
+                    auto sB_hi = local_tile(sB, Shape<_32, _16>{}, make_coord(0, 1));
+                    auto tBsB_lo = thr_mma.partition_B(sB_lo);
+                    auto tBsB_hi = thr_mma.partition_B(sB_hi);
+                    auto tBrB_lo = thr_mma.partition_fragment_B(sB_lo);
+                    auto tBrB_hi = thr_mma.partition_fragment_B(sB_hi);
+                    cute::copy(tBsB_lo, tBrB_lo);
+                    cute::copy(tBsB_hi, tBrB_hi);
 
-                    cute::gemm(tiled_mma, tArA, tBrB, tDKT_intra_acc);
+                    auto tArA_qk_tf32 = recast<tfloat32_t>(tArA_qk);
+                    auto tArA_kk_tf32 = recast<tfloat32_t>(tArA_kk);
+                    auto tBrB_lo_tf32 = recast<tfloat32_t>(tBrB_lo);
+                    auto tBrB_hi_tf32 = recast<tfloat32_t>(tBrB_hi);
+                    cute::gemm(tiled_mma, tArA_qk_tf32, tBrB_lo_tf32, tDKT_intra_acc);
+                    cute::gemm(tiled_mma, tArA_kk_tf32, tBrB_hi_tf32, tDKT_intra_acc);
                 }
 
                 // ---- QKG inter: 4 diagonal blocks with causal mask ----
@@ -1014,34 +1048,46 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
                     if (warp_id_in_wg != s) continue;
                     int block = s;
 
-                    auto cA   = make_identity_tensor(AShape{});
+                    auto sA_qk = local_tile(sDAqk_T, Shape<_16, _16>{}, make_coord(block, block));
+                    auto tAsA_qk = thr_mma.partition_A(sA_qk);
+                    auto tArA_qk = make_fragment_like(tAsA_qk);
+                    cute::copy(tAsA_qk, tArA_qk);
+                    auto tArA_kk = make_fragment_like(tAsA_qk);
+
+                    auto cA = make_identity_tensor(Shape<_16, _16>{});
                     auto tAcA = thr_mma.partition_A(cA);
-                    auto tArA = thr_mma.partition_fragment_A(sA_proto);
                     CUTE_UNROLL
-                    for (int i = 0; i < size(tArA); ++i) {
+                    for (int i = 0; i < size(tArA_qk); ++i) {
                         int r = get<0>(tAcA(i));
                         int c = get<1>(tAcA(i));
                         int g_j = block * 16 + r;
-                        int g_i;
-                        float v;
-                        if (c < 16) {
-                            g_i = block * 16 + c;
-                            v   = sDAqk(g_i, g_j);
-                        } else {
-                            g_i = block * 16 + (c - 16);
-                            v   = sDAkk(g_i, g_j);
-                        }
+                        int g_i = block * 16 + c;
                         bool keep = (g_i >= g_j) && (g_i < sub_seq_len) && (g_j < sub_seq_len);
-                        tArA(i) = keep ? tfloat32_t(v) : tfloat32_t(0.0f);
+                        if (!keep) {
+                            tArA_qk(i) = tfloat32_t(0.0f);
+                            tArA_kk(i) = tfloat32_t(0.0f);
+                        } else {
+                            tArA_kk(i) = tfloat32_t(sDAkk(g_i, g_j));
+                        }
                     }
 
                     Tensor sB = make_tensor(make_smem_ptr(smem->qkg_all.inter[s].data()),
                                             SmemLayoutMatBTF32Tranposed<2>{});
-                    auto tBsB = thr_mma.partition_B(sB);
-                    auto tBrB = thr_mma.partition_fragment_B(sB);
-                    cute::copy(tBsB, tBrB);
+                    auto sB_lo = local_tile(sB, Shape<_32, _16>{}, make_coord(0, 0));
+                    auto sB_hi = local_tile(sB, Shape<_32, _16>{}, make_coord(0, 1));
+                    auto tBsB_lo = thr_mma.partition_B(sB_lo);
+                    auto tBsB_hi = thr_mma.partition_B(sB_hi);
+                    auto tBrB_lo = thr_mma.partition_fragment_B(sB_lo);
+                    auto tBrB_hi = thr_mma.partition_fragment_B(sB_hi);
+                    cute::copy(tBsB_lo, tBrB_lo);
+                    cute::copy(tBsB_hi, tBrB_hi);
 
-                    cute::gemm(tiled_mma, tArA, tBrB, tDKT_inter_acc);
+                    auto tArA_qk_tf32 = recast<tfloat32_t>(tArA_qk);
+                    auto tArA_kk_tf32 = recast<tfloat32_t>(tArA_kk);
+                    auto tBrB_lo_tf32 = recast<tfloat32_t>(tBrB_lo);
+                    auto tBrB_hi_tf32 = recast<tfloat32_t>(tBrB_hi);
+                    cute::gemm(tiled_mma, tArA_qk_tf32, tBrB_lo_tf32, tDKT_inter_acc);
+                    cute::gemm(tiled_mma, tArA_kk_tf32, tBrB_hi_tf32, tDKT_inter_acc);
                 }
 
                 // R2S: intra off-diag dkt → smem_mma_dq (lower half reads with next_top scale);
