@@ -642,16 +642,12 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
     // =================================================================
     if (role == WGRole::LdSt) {
         cutlass::arch::warpgroup_reg_dealloc<REG_LDST>();
-        if (warp_idx == LOAD_WARP_IDX && elect_one_sync()) {
+        if (warp_idx == LOAD_WARP_IDX) {
+            const int lane = idx_in_warp;
+            const bool elected = elect_one_sync();
             for (; tile_scheduler.is_valid(); tile_scheduler.advance()) {
                 int A_phase = (state_phase >> (buf_idx_A + NUM_BUF)) & 1;
-#if KDA_BWD_SM90_DEBUG_PRINT
-                if (blockIdx.x == 0) printf("[LDST] before wait bar_dA_free buf=%d expect_phase=%d\n", buf_idx_A, A_phase);
-#endif
                 cute::wait_barrier(smem->bar_dA_free[buf_idx_A], A_phase ^ 1);
-#if KDA_BWD_SM90_DEBUG_PRINT
-                if (blockIdx.x == 0) printf("[LDST] after wait bar_dA_free buf=%d\n", buf_idx_A);
-#endif
 
                 int tid = tile_scheduler.get_current_tile_id();
 
@@ -664,8 +660,8 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
                 int sub_seq_len = min(T_TILE, seq_len - tile_idx * T_TILE);
 
 
-                // TMA load dAqk, dAkk.
-                {
+                // TMA load dAqk, dAkk (elected thread only).
+                if (elected) {
                     Tensor sDAqk = make_tensor(make_smem_ptr(smem->smem_daqk[buf_idx_A].data()), SmemLayoutDA{});
                     Tensor sDAkk = make_tensor(make_smem_ptr(smem->smem_dakk[buf_idx_A].data()), SmemLayoutDA{});
                     int tma_bytes_da = sizeof(make_tensor_like(sDAqk)) + sizeof(make_tensor_like(sDAkk));
@@ -684,10 +680,11 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
                     launch_tma_copy(tma_params.tma_dAkk, gDakk, sDAkk, smem->bar_load_dA_ready[buf_idx_A]);
                 }
 
-                // Load beta via the same elected Load thread.
+                // Load beta — parallelize across all 32 Load-warp lanes.
                 {
                     float* beta_base = (float*)params.beta_ptr;
-                    for (int i = 0; i < T_TILE; ++i) {
+                    CUTE_UNROLL
+                    for (int i = lane; i < T_TILE; i += 32) {
                         smem->beta_smem[buf_idx_A][i] =
                             (i < sub_seq_len) ? beta_base[(token_offset + tile_idx * T_TILE + i) * params.h + head_idx]
                                               : 0.0f;
@@ -695,15 +692,17 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
                     fence_view_async_shared();
                 }
 
-                // Signal Prep/MMA: dA + beta ready.
-                cute::arrive_barrier(smem->bar_load_dA_ready[buf_idx_A]);
+                // Signal Prep/MMA: dA + beta ready (elected thread only).
+                if (elected) {
+                    cute::arrive_barrier(smem->bar_load_dA_ready[buf_idx_A]);
+                }
 
                 for (int k_idx = 0; k_idx < K_ITERATION; ++k_idx) {
                     int local_phase = (state_phase >> buf_idx_value) & 1;
                     cute::wait_barrier(smem->bar_buf_free[buf_idx_value], local_phase ^ 1);
 
-                    // TMA load Q, K, G + dQ, dK, dG inter-chunk.
-                    {
+                    // TMA load Q, K, G + dQ, dK, dG inter-chunk (elected thread only).
+                    if (elected) {
                         Tensor sQ = make_tensor(make_smem_ptr(smem->smem_q[buf_idx_value].data()), SmemLayoutInputBF16{});
                         Tensor sK = make_tensor(make_smem_ptr(smem->smem_k[buf_idx_value].data()), SmemLayoutInputBF16{});
                         Tensor sG = make_tensor(make_smem_ptr(smem->smem_g[buf_idx_value].data()), SmemLayoutInputFP32{});
