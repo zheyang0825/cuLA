@@ -232,7 +232,26 @@ if not DISABLE_SM90:
             ],
             extra_compile_args={
                 "cxx": cxx_args + get_features_args(),
-                "nvcc": common_nvcc_flags,
+                "nvcc": common_nvcc_flags + ["-maxrregcount=152"],
+            },
+            include_dirs=common_include_dirs,
+        )
+    )
+
+# =====================================================================
+# Standalone extension: SM90 backward dqkg (fast iteration)
+# =====================================================================
+if not DISABLE_SM90:
+    ext_modules.append(
+        CUDAExtension(
+            name="cula._kda_bwd_dqkg_sm90",
+            sources=[
+                "csrc/api/kda_bwd_dqkg_sm90.cu",
+                "csrc/kda/sm90/bwd/dqkg/chunk_kda_bwd_sm90_dqkg.cu",
+            ],
+            extra_compile_args={
+                "cxx": cxx_args + get_features_args(),
+                "nvcc": common_nvcc_flags + ["-maxrregcount=152"],
             },
             include_dirs=common_include_dirs,
         )
