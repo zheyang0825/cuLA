@@ -198,6 +198,17 @@ get_acc_row_col(int tid, int v, int& row, int& col) {
     col = (lane % 4) * 2 + (v % 2) + warp_id * 8;
 }
 
+// Per-thread "pair" base position (rh in {0,1}): two adjacent fp32 acc values
+// (v=2*rh, v=2*rh+1) live at (row, col_base..col_base+1). Use this to issue
+// 8B-aligned float2 LDS/STS in epilogues — replaces 4 scalar scatter writes.
+__device__ __forceinline__ void
+get_acc_pair_row_col(int tid, int rh, int& row, int& col_base) {
+    int lane = tid % 32;
+    int warp_id = tid / 32;
+    row = (lane / 4) + rh * 8;
+    col_base = (lane % 4) * 2 + warp_id * 8;
+}
+
 // ============================================================
 // Main kernel
 // ============================================================
@@ -572,11 +583,15 @@ __launch_bounds__(NUM_THREADS) kda_bwd_intra_kernel_sm90(__grid_constant__ const
         }
         __syncthreads();
 
-        // Scatter: each thread computes final dq value and writes to smem
-        for (int v = 0; v < 4; ++v) {
-            int row, col;
-            get_acc_row_col(tid, v, row, col);
-            sStage(row, col) += dq2_acc[v];
+        // Scatter: each thread computes final dq value and writes to smem (vec float2)
+        for (int rh = 0; rh < 2; ++rh) {
+            int row, col_base;
+            get_acc_pair_row_col(tid, rh, row, col_base);
+            float2* p = reinterpret_cast<float2*>(&sStage(row, col_base));
+            float2 cur = *p;
+            cur.x += dq2_acc[rh * 2 + 0];
+            cur.y += dq2_acc[rh * 2 + 1];
+            *p = cur;
         }
         __syncthreads();
 
@@ -795,14 +810,25 @@ __launch_bounds__(NUM_THREADS) kda_bwd_intra_kernel_sm90(__grid_constant__ const
         auto gDgOut_tile = local_tile(mDgOut, tile_hk, make_coord(tile_row, i_k));
         auto sStage = make_tensor(make_smem_ptr(smem.s_acc.data()), SmemLayoutAcc{});
 
-        // ── dg_out: scatter compute to smem, vectorized float4 store ──
-        for (int v = 0; v < 4; ++v) {
-            int row, col;
-            get_acc_row_col(tid, v, row, col);
-            float qv = __bfloat162float(sQ(row, col));
-            float kv = __bfloat162float(sK(row, col));
-            float dg_prev = (!is_boundary || (i_ti + row) < T_seq) ? gDg_tile(row, col) : 0.f;
-            sStage(row, col) = qv * dq2_acc[v] + (dk2_acc[v] - dkt_acc[v]) * kv + dg_prev;
+        // ── dg_out: scatter compute to smem (vec float2 path) ──
+        for (int rh = 0; rh < 2; ++rh) {
+            int row, col_base;
+            get_acc_pair_row_col(tid, rh, row, col_base);
+            // qv, kv at (row, col_base) and (row, col_base+1) — bf16 packed
+            uint32_t qpack = *reinterpret_cast<uint32_t*>(&sQ(row, col_base));
+            uint32_t kpack = *reinterpret_cast<uint32_t*>(&sK(row, col_base));
+            __nv_bfloat162 q2 = bitcast_bf162(qpack);
+            __nv_bfloat162 k2 = bitcast_bf162(kpack);
+            float2 qf = __bfloat1622float2(q2);
+            float2 kf = __bfloat1622float2(k2);
+            float2 prev{0.f, 0.f};
+            if (!is_boundary || (i_ti + row) < T_seq) {
+                prev = *reinterpret_cast<const float2*>(&gDg_tile(row, col_base));
+            }
+            float2 out;
+            out.x = qf.x * dq2_acc[rh * 2 + 0] + (dk2_acc[rh * 2 + 0] - dkt_acc[rh * 2 + 0]) * kf.x + prev.x;
+            out.y = qf.y * dq2_acc[rh * 2 + 1] + (dk2_acc[rh * 2 + 1] - dkt_acc[rh * 2 + 1]) * kf.y + prev.y;
+            *reinterpret_cast<float2*>(&sStage(row, col_base)) = out;
         }
         __syncthreads();
 
@@ -840,11 +866,15 @@ __launch_bounds__(NUM_THREADS) kda_bwd_intra_kernel_sm90(__grid_constant__ const
         }
         __syncthreads();
 
-        // ── dk_out: scatter compute to smem, vectorized bf16x4 store ──
-        for (int v = 0; v < 4; ++v) {
-            int row, col;
-            get_acc_row_col(tid, v, row, col);
-            sStage(row, col) += dk2_acc[v] + dkt_acc[v];
+        // ── dk_out: scatter compute to smem, vectorized bf16x4 store (vec float2 path) ──
+        for (int rh = 0; rh < 2; ++rh) {
+            int row, col_base;
+            get_acc_pair_row_col(tid, rh, row, col_base);
+            float2* p = reinterpret_cast<float2*>(&sStage(row, col_base));
+            float2 cur = *p;
+            cur.x += dk2_acc[rh * 2 + 0] + dkt_acc[rh * 2 + 0];
+            cur.y += dk2_acc[rh * 2 + 1] + dkt_acc[rh * 2 + 1];
+            *p = cur;
         }
         __syncthreads();
 
