@@ -851,14 +851,16 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
                 // === KG PHASE: dQ (intra off-diag) + dQ2 (inter diag) ===
                 cute::wait_barrier(smem->bar_kg_all_ready, b_phase);
 
+                Tensor sDQ   = make_tensor(make_smem_ptr(smem->smem_mma_dq.data()),               SmemLayoutInputFP32{});
+                Tensor sDQ2  = make_tensor(make_smem_ptr(smem->smem_mma_dq2.data()),              SmemLayoutInputFP32{});
+                Tensor sDKL  = make_tensor(make_smem_ptr(smem->smem_mma_dk_lower_intra.data()),   SmemLayoutInputFP32{});
+                Tensor sDKL2 = make_tensor(make_smem_ptr(smem->smem_mma_dk_lower_inter.data()),   SmemLayoutInputFP32{});
+
+                {
                 FragC_t tDQ_acc   = partition_fragment_C(tiled_mma, Shape<_16, Int<K_TILE>>{});
-                FragC_t tDQ2_acc  = partition_fragment_C(tiled_mma, Shape<_16, Int<K_TILE>>{});
                 FragC_t tDKL_acc  = partition_fragment_C(tiled_mma, Shape<_16, Int<K_TILE>>{});
-                FragC_t tDKL2_acc = partition_fragment_C(tiled_mma, Shape<_16, Int<K_TILE>>{});
                 clear(tDQ_acc);
-                clear(tDQ2_acc);
                 clear(tDKL_acc);
-                clear(tDKL2_acc);
 
                 // ---- KG intra: 6 strict-off-diagonal (q_block, k_block) pairs ----
                 CUTE_UNROLL
@@ -906,6 +908,21 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
                     cute::gemm(tiled_mma, tArA_kk_tf32, tBrB_tf32, tDKL_acc);
                 }
 
+                // R2S intra: free up registers for inter-phase accumulators.
+                {
+                    auto sDQ_sub   = local_tile(sDQ,   Shape<_16, Int<K_TILE>>{}, make_coord(warp_id_in_wg, _0{}));
+                    auto sDKL_sub  = local_tile(sDKL,  Shape<_16, Int<K_TILE>>{}, make_coord(warp_id_in_wg, _0{}));
+                    cute::copy(tDQ_acc,  thr_mma.partition_C(sDQ_sub));
+                    cute::copy(tDKL_acc, thr_mma.partition_C(sDKL_sub));
+                }
+                }
+
+                {
+                FragC_t tDQ2_acc  = partition_fragment_C(tiled_mma, Shape<_16, Int<K_TILE>>{});
+                FragC_t tDKL2_acc = partition_fragment_C(tiled_mma, Shape<_16, Int<K_TILE>>{});
+                clear(tDQ2_acc);
+                clear(tDKL2_acc);
+
                 // ---- KG inter: 4 diagonal blocks with causal mask ----
                 CUTE_UNROLL
                 for (int s = 0; s < 4; ++s) {
@@ -951,25 +968,16 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
                     cute::gemm(tiled_mma, tArA_kk_tf32, tBrB_tf32, tDKL2_acc);
                 }
 
-                // R2S: each warp writes its 16-row slice to smem_mma_dq / smem_mma_dq2 / dk_lower buffers.
+                // R2S inter
                 {
-                    Tensor sDQ   = make_tensor(make_smem_ptr(smem->smem_mma_dq.data()),               SmemLayoutInputFP32{});
-                    Tensor sDQ2  = make_tensor(make_smem_ptr(smem->smem_mma_dq2.data()),              SmemLayoutInputFP32{});
-                    Tensor sDKL  = make_tensor(make_smem_ptr(smem->smem_mma_dk_lower_intra.data()),   SmemLayoutInputFP32{});
-                    Tensor sDKL2 = make_tensor(make_smem_ptr(smem->smem_mma_dk_lower_inter.data()),   SmemLayoutInputFP32{});
-                    auto sDQ_sub   = local_tile(sDQ,   Shape<_16, Int<K_TILE>>{}, make_coord(warp_id_in_wg, _0{}));
                     auto sDQ2_sub  = local_tile(sDQ2,  Shape<_16, Int<K_TILE>>{}, make_coord(warp_id_in_wg, _0{}));
-                    auto sDKL_sub  = local_tile(sDKL,  Shape<_16, Int<K_TILE>>{}, make_coord(warp_id_in_wg, _0{}));
                     auto sDKL2_sub = local_tile(sDKL2, Shape<_16, Int<K_TILE>>{}, make_coord(warp_id_in_wg, _0{}));
-                    auto tCsDQ   = thr_mma.partition_C(sDQ_sub);
-                    auto tCsDQ2  = thr_mma.partition_C(sDQ2_sub);
-                    auto tCsDKL  = thr_mma.partition_C(sDKL_sub);
-                    auto tCsDKL2 = thr_mma.partition_C(sDKL2_sub);
-                    cute::copy(tDQ_acc,   tCsDQ);
-                    cute::copy(tDQ2_acc,  tCsDQ2);
-                    cute::copy(tDKL_acc,  tCsDKL);
-                    cute::copy(tDKL2_acc, tCsDKL2);
+                    cute::copy(tDQ2_acc,  thr_mma.partition_C(sDQ2_sub));
+                    cute::copy(tDKL2_acc, thr_mma.partition_C(sDKL2_sub));
                 }
+                }
+
+                // (legacy combined R2S removed — split above per phase)
 
                 fence_view_async_shared();
                 cute::arrive_barrier(smem->bar_mma_dq_done);
@@ -979,10 +987,12 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
                 // Wait for Prep to finish reading dQ/dQ2 before we overwrite smem_mma_dq with dKt.
                 cute::wait_barrier(smem->bar_prep_dq_consumed, b_phase);
 
+                Tensor sDKt_intra = make_tensor(make_smem_ptr(smem->smem_mma_dq.data()),  SmemLayoutInputFP32{});
+                Tensor sDKt_inter = make_tensor(make_smem_ptr(smem->smem_mma_dq2.data()), SmemLayoutInputFP32{});
+
+                {
                 FragC_t tDKT_intra_acc = partition_fragment_C(tiled_mma, Shape<_16, Int<K_TILE>>{});
-                FragC_t tDKT_inter_acc = partition_fragment_C(tiled_mma, Shape<_16, Int<K_TILE>>{});
                 clear(tDKT_intra_acc);
-                clear(tDKT_inter_acc);
 
                 // QKG A operand: dA_T(j, i) — j is the 16 "rows" (M dim of mma),
                 // i is the 16 "cols" (K dim of mma). Original A was 16x32 = [dAqk^T | dAkk^T].
@@ -1042,6 +1052,17 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
                     cute::gemm(tiled_mma, tArA_kk_tf32, tBrB_hi_tf32, tDKT_intra_acc);
                 }
 
+                // R2S intra dkt → free up registers before inter accumulator.
+                {
+                    auto sDKt_intra_sub = local_tile(sDKt_intra, Shape<_16, Int<K_TILE>>{}, make_coord(warp_id_in_wg, _0{}));
+                    cute::copy(tDKT_intra_acc, thr_mma.partition_C(sDKt_intra_sub));
+                }
+                }
+
+                {
+                FragC_t tDKT_inter_acc = partition_fragment_C(tiled_mma, Shape<_16, Int<K_TILE>>{});
+                clear(tDKT_inter_acc);
+
                 // ---- QKG inter: 4 diagonal blocks with causal mask ----
                 CUTE_UNROLL
                 for (int s = 0; s < 4; ++s) {
@@ -1090,17 +1111,16 @@ __launch_bounds__(NUM_THREADS, 1) kda_bwd_intra_sm90_kernel(
                     cute::gemm(tiled_mma, tArA_kk_tf32, tBrB_hi_tf32, tDKT_inter_acc);
                 }
 
-                // R2S: intra off-diag dkt → smem_mma_dq (lower half reads with next_top scale);
-                //      inter diagonal dkt → smem_mma_dq2 (upper half reads with mid scale).
+                // R2S inter dkt
                 {
-                    Tensor sDKt_intra = make_tensor(make_smem_ptr(smem->smem_mma_dq.data()),  SmemLayoutInputFP32{});
-                    Tensor sDKt_inter = make_tensor(make_smem_ptr(smem->smem_mma_dq2.data()), SmemLayoutInputFP32{});
-                    auto sDKt_intra_sub = local_tile(sDKt_intra, Shape<_16, Int<K_TILE>>{}, make_coord(warp_id_in_wg, _0{}));
                     auto sDKt_inter_sub = local_tile(sDKt_inter, Shape<_16, Int<K_TILE>>{}, make_coord(warp_id_in_wg, _0{}));
-                    auto tCsDKt_intra = thr_mma.partition_C(sDKt_intra_sub);
-                    auto tCsDKt_inter = thr_mma.partition_C(sDKt_inter_sub);
-                    cute::copy(tDKT_intra_acc, tCsDKt_intra);
-                    cute::copy(tDKT_inter_acc, tCsDKt_inter);
+                    cute::copy(tDKT_inter_acc, thr_mma.partition_C(sDKt_inter_sub));
+                }
+                }
+
+                // (legacy combined R2S removed — split above)
+                {
+                    (void)0;
                 }
 
                 fence_view_async_shared();

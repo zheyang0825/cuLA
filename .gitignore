@@ -27,3 +27,4 @@ tmp
 .claude/settings.json
 cula/_version.py
 .venv
+.venv2
