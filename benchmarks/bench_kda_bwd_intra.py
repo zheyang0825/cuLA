@@ -21,6 +21,7 @@ import torch
 import triton
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+os.environ.setdefault("FLA_USE_FAST_OPS", os.getenv("CULA_USE_FAST_MATH", "1"))  # Enable fast ops in FLA for fair comparison
 
 from fla.ops.kda.chunk_intra import chunk_kda_bwd_intra as fla_chunk_kda_bwd_intra
 
@@ -104,8 +105,10 @@ def run_fla(data):
     return fla_chunk_kda_bwd_intra(
         data["q"], data["k"], data["g"], data["beta"],
         data["dAqk"], data["dAkk"], data["dq"], data["dk"], data["db"], data["dg"],
-        data["cu_seqlens"], data["chunk_indices"],
-        data["chunk_size"], safe_gate=True,
+        data["cu_seqlens"],
+        chunk_indices=data["chunk_indices"],
+        chunk_size=data["chunk_size"],
+        safe_gate=True,
     )
 
 
