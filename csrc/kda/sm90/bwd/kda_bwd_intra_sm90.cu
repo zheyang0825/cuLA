@@ -552,31 +552,17 @@ __launch_bounds__(NUM_THREADS, 8) kda_bwd_intra_sm90_kernel(__grid_constant__ co
 
     // ════════════════════════════════════════════════════════════════════════
     // PHASE 1 EPILOGUE: store dq_out, db_out (atomicAdd across i_k)
+    // Lever 4: write acc → smem (no RMW), then vec-load gDq+sStage and store.
     // ════════════════════════════════════════════════════════════════════════
     {
         auto gDq_tile = local_tile(mDq, tile_hk, make_coord(tile_row, i_k));
         auto gDqOut_tile = local_tile(mDqOut, tile_hk, make_coord(tile_row, i_k));
         auto sStage = make_tensor(make_smem_ptr(smem.s_acc.data()), SmemLayoutAcc{});
 
-        {
-            int vi = tid;
-            int r = (vi * 4) / BK;
-            int c = (vi * 4) % BK;
-            float4 prev = {0.f, 0.f, 0.f, 0.f};
-            if ((i_ti + r) < T_seq) {
-                prev = *reinterpret_cast<const float4*>(&gDq_tile(r, c));
-            }
-            sStage(r, c + 0) = prev.x;
-            sStage(r, c + 1) = prev.y;
-            sStage(r, c + 2) = prev.z;
-            sStage(r, c + 3) = prev.w;
-        }
-        __syncthreads();
-
         for (int v = 0; v < 4; ++v) {
             int row, col;
             get_acc_row_col(tid, v, row, col);
-            sStage(row, col) += dq2_acc[v];
+            sStage(row, col) = dq2_acc[v];
         }
         __syncthreads();
 
@@ -585,11 +571,12 @@ __launch_bounds__(NUM_THREADS, 8) kda_bwd_intra_sm90_kernel(__grid_constant__ co
             int r = (vi * 4) / BK;
             int c = (vi * 4) % BK;
             if ((i_ti + r) < T_seq) {
+                float4 prev = *reinterpret_cast<const float4*>(&gDq_tile(r, c));
                 float4 val;
-                val.x = sStage(r, c + 0);
-                val.y = sStage(r, c + 1);
-                val.z = sStage(r, c + 2);
-                val.w = sStage(r, c + 3);
+                val.x = sStage(r, c + 0) + prev.x;
+                val.y = sStage(r, c + 1) + prev.y;
+                val.z = sStage(r, c + 2) + prev.z;
+                val.w = sStage(r, c + 3) + prev.w;
                 *reinterpret_cast<float4*>(&gDqOut_tile(r, c)) = val;
             }
         }
@@ -806,25 +793,10 @@ __launch_bounds__(NUM_THREADS, 8) kda_bwd_intra_sm90_kernel(__grid_constant__ co
         }
         __syncthreads();
 
-        {
-            int vi = tid;
-            int r = (vi * 4) / BK;
-            int c = (vi * 4) % BK;
-            float4 prev = {0.f, 0.f, 0.f, 0.f};
-            if ((i_ti + r) < T_seq) {
-                prev = *reinterpret_cast<const float4*>(&gDk_tile(r, c));
-            }
-            sStage(r, c + 0) = prev.x;
-            sStage(r, c + 1) = prev.y;
-            sStage(r, c + 2) = prev.z;
-            sStage(r, c + 3) = prev.w;
-        }
-        __syncthreads();
-
         for (int v = 0; v < 4; ++v) {
             int row, col;
             get_acc_row_col(tid, v, row, col);
-            sStage(row, col) += dk2_acc[v] + dkt_acc[v];
+            sStage(row, col) = dk2_acc[v] + dkt_acc[v];
         }
         __syncthreads();
 
@@ -833,11 +805,12 @@ __launch_bounds__(NUM_THREADS, 8) kda_bwd_intra_sm90_kernel(__grid_constant__ co
             int r = (vi * 4) / BK;
             int c = (vi * 4) % BK;
             if ((i_ti + r) < T_seq) {
+                float4 prev = *reinterpret_cast<const float4*>(&gDk_tile(r, c));
                 float4 val;
-                val.x = sStage(r, c + 0);
-                val.y = sStage(r, c + 1);
-                val.z = sStage(r, c + 2);
-                val.w = sStage(r, c + 3);
+                val.x = sStage(r, c + 0) + prev.x;
+                val.y = sStage(r, c + 1) + prev.y;
+                val.z = sStage(r, c + 2) + prev.z;
+                val.w = sStage(r, c + 3) + prev.w;
                 *reinterpret_cast<float4*>(&gDkOut_tile(r, c)) = val;
             }
         }
