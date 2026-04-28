@@ -124,3 +124,35 @@ exp2(gn_i[d] - G[j,d]) = exp2(gn_REF[d] - G[j,d]) * exp2(gn_i[d] - gn_REF[d])
 3. **cp.async 双缓冲 dA(j+1)** 与 mma(j) 重叠。预计 1.1-1.2×。
 4. **Bank-conflict free epilogue**：直接 register→gmem 的 add（绕过 s_acc 暂存）
    或者改用 padded-stride 而非 swizzle。预计 1.1-1.3×。
+
+## 2026-05 进展 (Lever 4 实装 + NCU iter1)
+
+* **Lever 4** (epilogue smem RMW → 单 pass merge) 已 commit `b990dac2`：
+  dq_out / dk_out epilogue 改为 acc→smem stage → vec-load gmem prev + add + store。
+  消除一次 RMW + 一次 `__syncthreads()`。**0.86× → 0.89× FLA**.
+* **Lever 1** (full-chunk SMEM preload) 已尝试并 revert：因 sibling CTAs (i_i=*) 共享 L1，
+  原 j-loop 的 K/G gmem 读已被 cache 命中；预载反而把每 CTA DRAM 体积 ×4，回退到 0.81–0.83×。
+
+**NCU iter1 (Phase + Lever 4) 关键信号** (B=4 T=2048 H=4 D=128, 128 线程, grid (16,64,4)):
+* SM Throughput 60.5%, Memory 71%, L1/TEX 75%, DRAM 17.4% → 仍 SMEM/L1 bound
+* Achieved Occupancy 45.6% (理论 50%, 由 64 reg/thread 限制 8 block/SM)
+* Eligible Warps/Scheduler 1.48, Issued 0.64, No Eligible 36%
+* Warp Cycles/Issued Inst 11.4
+* Shared load conflict 30.5% (1.52M conflicts / 5.0M wavefronts) → est 22.9% speedup
+* Shared store conflict 33.7% (517K / 1.54M) → est 25.3% speedup
+* FP32 fused vs non-fused: 262K fused / 2.13M non-fused → est 7.7% via FMA
+* Tail effect 25% (3 full + 1 partial wave of 929 blocks)
+* Uncoalesced global load 6% excess sectors → est 5.7%
+
+**剩余路径 (按 ROI)**：
+1. **Lever 2 (NK=1, BK=128)** — 重写 ~200 行；MMA tile 扩到 m16n128，4 N-tile acc；
+   消除 db atomicAdd；DRAM 节省 75% dA 重复读取。预计 +20-30%。
+2. **Bank conflict 修复** — 主嫌疑在 epilogue `sStage(row,col)=acc[v]` 的 MMA-C 写模式与
+   `Swizzle<3,2,3>` 不匹配。可换 padded-stride layout 或用 warp shuffle 在寄存器层面
+   完成 8-thread/row gather → coalesced float4 直写 gmem，绕过 s_acc。预计 +10-20%。
+3. **WGMMA (Lever 5, anchor split)** — sm_90a 已启用，WGMMA m64 需 BC 从 16 拼到 64
+   (跨 4 个 sub-chunks)，是上面 anchor 拆分方案。重构成本最高，但唯一剩下能突破
+   tensor-core 利用率瓶颈的杠杆。预计 +50-100%。
+
+**当前 HEAD**: `b990dac2`, 12/15 ground-truth tests 通过 (3 个 phase2_b_operands
+是 pre-existing failures，依赖未实现的 debug-export API)。
