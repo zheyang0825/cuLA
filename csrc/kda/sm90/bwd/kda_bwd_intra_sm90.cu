@@ -547,49 +547,9 @@ __launch_bounds__(NUM_THREADS) kda_bwd_intra_kernel_sm90(__grid_constant__ const
         auto gDqOut_tile = local_tile(mDqOut, tile_hk, make_coord(tile_row, i_k));
         auto sStage = make_tensor(make_smem_ptr(smem.s_acc.data()), SmemLayoutAcc{});
 
-        // Preload old dq row-major so the hot dq_prev reads avoid accumulator-mapped gmem gathers.
-        {
-            constexpr int VEC_ELEMS = BC * BK / 4;  // 128
-            int vi = tid;
-            int r = (vi * 4) / BK;
-            int c = (vi * 4) % BK;
-            float4 prev = {0.f, 0.f, 0.f, 0.f};
-            if ((i_ti + r) < T_seq) {
-                prev = *reinterpret_cast<const float4*>(&gDq_tile(r, c));
-            }
-            sStage(r, c + 0) = prev.x;
-            sStage(r, c + 1) = prev.y;
-            sStage(r, c + 2) = prev.z;
-            sStage(r, c + 3) = prev.w;
-        }
-        __syncthreads();
+        sm90_bwd_intra::epilogue_output_dq<BC, BK, NUM_THREADS>(
+            gDq_tile, gDqOut_tile, sStage, dq2_acc, T_seq, i_ti, tid);
 
-        // Scatter: each thread computes final dq value and writes to smem (vec float2)
-        for (int rh = 0; rh < 2; ++rh) {
-            int row, col_base;
-            get_acc_pair_row_col(tid, rh, row, col_base);
-            float2* p = reinterpret_cast<float2*>(&sStage(row, col_base));
-            float2 cur = *p;
-            cur.x += dq2_acc[rh * 2 + 0];
-            cur.y += dq2_acc[rh * 2 + 1];
-            *p = cur;
-        }
-        __syncthreads();
-
-        // Vectorized store to gmem as bf16x4 (64-bit)
-        {
-            int vi = tid;
-            int r = (vi * 4) / BK;
-            int c = (vi * 4) % BK;
-            if ((i_ti + r) < T_seq) {
-                __nv_bfloat162 lo = __floats2bfloat162_rn(sStage(r, c + 0), sStage(r, c + 1));
-                __nv_bfloat162 hi = __floats2bfloat162_rn(sStage(r, c + 2), sStage(r, c + 3));
-                uint2 packed;
-                packed.x = reinterpret_cast<uint32_t&>(lo);
-                packed.y = reinterpret_cast<uint32_t&>(hi);
-                *reinterpret_cast<uint2*>(&gDqOut_tile(r, c)) = packed;
-            }
-        }
         if (tid < BC && (i_ti + tid) < T_seq) {
             mDBout(i_ti + tid) = smem.s_db[tid];
         }
@@ -743,89 +703,13 @@ __launch_bounds__(NUM_THREADS) kda_bwd_intra_kernel_sm90(__grid_constant__ const
         auto gDgOut_tile = local_tile(mDgOut, tile_hk, make_coord(tile_row, i_k));
         auto sStage = make_tensor(make_smem_ptr(smem.s_acc.data()), SmemLayoutAcc{});
 
-        // ── dg_out: scatter compute to smem (vec float2 path) ──
-        for (int rh = 0; rh < 2; ++rh) {
-            int row, col_base;
-            get_acc_pair_row_col(tid, rh, row, col_base);
-            // qv, kv at (row, col_base) and (row, col_base+1) — bf16 packed
-            uint32_t qpack = *reinterpret_cast<uint32_t*>(&sQ(row, col_base));
-            uint32_t kpack = *reinterpret_cast<uint32_t*>(&sK(row, col_base));
-            __nv_bfloat162 q2 = bitcast_bf162(qpack);
-            __nv_bfloat162 k2 = bitcast_bf162(kpack);
-            float2 qf = __bfloat1622float2(q2);
-            float2 kf = __bfloat1622float2(k2);
-            float2 prev{0.f, 0.f};
-            if (!is_boundary || (i_ti + row) < T_seq) {
-                prev = *reinterpret_cast<const float2*>(&gDg_tile(row, col_base));
-            }
-            float2 out;
-            out.x = qf.x * dq2_acc[rh * 2 + 0] + (dk2_acc[rh * 2 + 0] - dkt_acc[rh * 2 + 0]) * kf.x + prev.x;
-            out.y = qf.y * dq2_acc[rh * 2 + 1] + (dk2_acc[rh * 2 + 1] - dkt_acc[rh * 2 + 1]) * kf.y + prev.y;
-            *reinterpret_cast<float2*>(&sStage(row, col_base)) = out;
-        }
+        sm90_bwd_intra::epilogue_output_dg<BC, BK, NUM_THREADS>(
+            sQ, sK, gDg_tile, gDgOut_tile, sStage,
+            dq2_acc, dk2_acc, dkt_acc, T_seq, i_ti, is_boundary, tid);
         __syncthreads();
 
-        // BC*BK/4 = 128 = NUM_THREADS → 1 float4 store per thread
-        {
-            constexpr int VEC_ELEMS = BC * BK / 4;  // 128
-            int vi = tid;
-            int r = (vi * 4) / BK;
-            int c = (vi * 4) % BK;
-            if ((i_ti + r) < T_seq) {
-                float4 val;
-                val.x = sStage(r, c + 0);
-                val.y = sStage(r, c + 1);
-                val.z = sStage(r, c + 2);
-                val.w = sStage(r, c + 3);
-                *reinterpret_cast<float4*>(&gDgOut_tile(r, c)) = val;
-            }
-        }
-        __syncthreads();
-
-        // Preload old dk row-major so the hot dk_prev reads avoid accumulator-mapped gmem gathers.
-        {
-            constexpr int VEC_ELEMS = BC * BK / 4;  // 128
-            int vi = tid;
-            int r = (vi * 4) / BK;
-            int c = (vi * 4) % BK;
-            float4 prev = {0.f, 0.f, 0.f, 0.f};
-            if ((i_ti + r) < T_seq) {
-                prev = *reinterpret_cast<const float4*>(&gDk_tile(r, c));
-            }
-            sStage(r, c + 0) = prev.x;
-            sStage(r, c + 1) = prev.y;
-            sStage(r, c + 2) = prev.z;
-            sStage(r, c + 3) = prev.w;
-        }
-        __syncthreads();
-
-        // ── dk_out: scatter compute to smem, vectorized bf16x4 store (vec float2 path) ──
-        for (int rh = 0; rh < 2; ++rh) {
-            int row, col_base;
-            get_acc_pair_row_col(tid, rh, row, col_base);
-            float2* p = reinterpret_cast<float2*>(&sStage(row, col_base));
-            float2 cur = *p;
-            cur.x += dk2_acc[rh * 2 + 0] + dkt_acc[rh * 2 + 0];
-            cur.y += dk2_acc[rh * 2 + 1] + dkt_acc[rh * 2 + 1];
-            *p = cur;
-        }
-        __syncthreads();
-
-        // BC*BK/8 = 64, 128 threads → 2 threads per chunk, half idle
-        // Use 4-wide bf16 stores (64-bit): BC*BK/4 = 128 = NUM_THREADS
-        {
-            int vi = tid;
-            int r = (vi * 4) / BK;
-            int c = (vi * 4) % BK;
-            if ((i_ti + r) < T_seq) {
-                __nv_bfloat162 lo = __floats2bfloat162_rn(sStage(r, c + 0), sStage(r, c + 1));
-                __nv_bfloat162 hi = __floats2bfloat162_rn(sStage(r, c + 2), sStage(r, c + 3));
-                uint2 packed;
-                packed.x = reinterpret_cast<uint32_t&>(lo);
-                packed.y = reinterpret_cast<uint32_t&>(hi);
-                *reinterpret_cast<uint2*>(&gDkOut_tile(r, c)) = packed;
-            }
-        }
+        sm90_bwd_intra::epilogue_output_dk<BC, BK, NUM_THREADS>(
+            gDk_tile, gDkOut_tile, sStage, dk2_acc, dkt_acc, T_seq, i_ti, tid);
     }
 }
 

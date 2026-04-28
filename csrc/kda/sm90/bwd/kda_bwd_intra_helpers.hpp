@@ -178,3 +178,189 @@ setup_intra_fused_diag(
 }
 
 }  // namespace sm90_bwd_intra
+
+// ============================================================
+// SM90 bwd_intra epilogue helpers
+//
+// Mirror SM100 util_func.h `epilogue_output_dq/dg/dk` structurally:
+//   * named helpers per output tensor
+//   * preload-then-scatter-add-then-store flow
+//
+// SM90 adaptations vs SM100:
+//   * SM100 has TMEM (1 thread = 1 row × K_TILE cols), can write 256B chunks
+//     directly to gmem. SM90's MMA accumulator is scattered registers
+//     (row = lane/4 + (v/2)*8, col = lane%4*2 + warp*8), so we MUST stage
+//     through smem to coalesce. The "epilogue" pattern below preserves
+//     coalesced gmem stores via a single sStage scratchpad shared with
+//     dg-computation.
+//   * Per-thread "pair" accessor: 2 fp32 values at adjacent cols
+//     (v=2*rh, v=2*rh+1) → float2 LDS/STS replaces 4 scalar scatters.
+// ============================================================
+
+namespace sm90_bwd_intra {
+
+// SM80 16x8x8 f32 accumulator scatter mapping.
+__device__ __forceinline__ void
+get_acc_row_col(int tid, int v, int& row, int& col) {
+    int lane = tid % 32;
+    int warp_id = tid / 32;
+    row = (lane / 4) + (v / 2) * 8;
+    col = (lane % 4) * 2 + (v % 2) + warp_id * 8;
+}
+
+// Per-thread "pair" base position (rh in {0,1}): two adjacent fp32 acc values
+// (v=2*rh, v=2*rh+1) live at (row, col_base..col_base+1).
+__device__ __forceinline__ void
+get_acc_pair_row_col(int tid, int rh, int& row, int& col_base) {
+    int lane = tid % 32;
+    int warp_id = tid / 32;
+    row = (lane / 4) + rh * 8;
+    col_base = (lane % 4) * 2 + warp_id * 8;
+}
+
+// ──────────────────────────────────────────────────────────────────
+// epilogue_output_dq: preload dq_prev → sStage, scatter-add dq_acc,
+//                     vectorized bf16x4 store to gmem.
+// Caller must __syncthreads() before and after this helper.
+// ──────────────────────────────────────────────────────────────────
+template <int BC, int BK, int NUM_THREADS, class GDq, class GDqOut, class SStage>
+__device__ __forceinline__ void
+epilogue_output_dq(
+    GDq const& gDq_tile, GDqOut& gDqOut_tile, SStage& sStage,
+    const float dq_acc[4], int T_seq, int i_ti, int tid)
+{
+    static_assert(BC * BK / 4 == NUM_THREADS, "1 chunk/thread expected");
+    // Preload dq_prev row-major.
+    int vi = tid;
+    int r = (vi * 4) / BK;
+    int c = (vi * 4) % BK;
+    float4 prev = {0.f, 0.f, 0.f, 0.f};
+    if ((i_ti + r) < T_seq) {
+        prev = *reinterpret_cast<const float4*>(&gDq_tile(r, c));
+    }
+    sStage(r, c + 0) = prev.x;
+    sStage(r, c + 1) = prev.y;
+    sStage(r, c + 2) = prev.z;
+    sStage(r, c + 3) = prev.w;
+    __syncthreads();
+
+    // Scatter add via per-thread (row, col_base) accessor.
+    for (int rh = 0; rh < 2; ++rh) {
+        int row, col_base;
+        get_acc_pair_row_col(tid, rh, row, col_base);
+        float2* p = reinterpret_cast<float2*>(&sStage(row, col_base));
+        float2 cur = *p;
+        cur.x += dq_acc[rh * 2 + 0];
+        cur.y += dq_acc[rh * 2 + 1];
+        *p = cur;
+    }
+    __syncthreads();
+
+    // Vectorized bf16x4 store (64-bit per thread).
+    if ((i_ti + r) < T_seq) {
+        __nv_bfloat162 lo = __floats2bfloat162_rn(sStage(r, c + 0), sStage(r, c + 1));
+        __nv_bfloat162 hi = __floats2bfloat162_rn(sStage(r, c + 2), sStage(r, c + 3));
+        uint2 packed;
+        packed.x = reinterpret_cast<uint32_t&>(lo);
+        packed.y = reinterpret_cast<uint32_t&>(hi);
+        *reinterpret_cast<uint2*>(&gDqOut_tile(r, c)) = packed;
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────
+// epilogue_output_dg: scatter-compute dg = q*dq + (dk2-dkt)*k + dg_prev
+//                     into sStage, vectorized float4 store to gmem.
+// Caller must __syncthreads() before and after this helper.
+// ──────────────────────────────────────────────────────────────────
+template <int BC, int BK, int NUM_THREADS,
+          class SQ, class SK, class GDg, class GDgOut, class SStage>
+__device__ __forceinline__ void
+epilogue_output_dg(
+    SQ const& sQ, SK const& sK,
+    GDg const& gDg_tile, GDgOut& gDgOut_tile, SStage& sStage,
+    const float dq_acc[4], const float dk_acc[4], const float dkt_acc[4],
+    int T_seq, int i_ti, bool is_boundary, int tid)
+{
+    static_assert(BC * BK / 4 == NUM_THREADS, "1 chunk/thread expected");
+    for (int rh = 0; rh < 2; ++rh) {
+        int row, col_base;
+        get_acc_pair_row_col(tid, rh, row, col_base);
+        uint32_t qpack = *reinterpret_cast<uint32_t*>(&sQ(row, col_base));
+        uint32_t kpack = *reinterpret_cast<uint32_t*>(&sK(row, col_base));
+        __nv_bfloat162 q2 = _bitcast_bf162(qpack);
+        __nv_bfloat162 k2 = _bitcast_bf162(kpack);
+        float2 qf = __bfloat1622float2(q2);
+        float2 kf = __bfloat1622float2(k2);
+        float2 prev{0.f, 0.f};
+        if (!is_boundary || (i_ti + row) < T_seq) {
+            prev = *reinterpret_cast<const float2*>(&gDg_tile(row, col_base));
+        }
+        float2 out;
+        out.x = qf.x * dq_acc[rh * 2 + 0] + (dk_acc[rh * 2 + 0] - dkt_acc[rh * 2 + 0]) * kf.x + prev.x;
+        out.y = qf.y * dq_acc[rh * 2 + 1] + (dk_acc[rh * 2 + 1] - dkt_acc[rh * 2 + 1]) * kf.y + prev.y;
+        *reinterpret_cast<float2*>(&sStage(row, col_base)) = out;
+    }
+    __syncthreads();
+
+    int vi = tid;
+    int r = (vi * 4) / BK;
+    int c = (vi * 4) % BK;
+    if ((i_ti + r) < T_seq) {
+        float4 val;
+        val.x = sStage(r, c + 0);
+        val.y = sStage(r, c + 1);
+        val.z = sStage(r, c + 2);
+        val.w = sStage(r, c + 3);
+        *reinterpret_cast<float4*>(&gDgOut_tile(r, c)) = val;
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────
+// epilogue_output_dk: preload dk_prev → sStage, scatter-add dk_acc + dkt_acc,
+//                     vectorized bf16x4 store to gmem.
+// Caller must __syncthreads() before and after this helper.
+// ──────────────────────────────────────────────────────────────────
+template <int BC, int BK, int NUM_THREADS, class GDk, class GDkOut, class SStage>
+__device__ __forceinline__ void
+epilogue_output_dk(
+    GDk const& gDk_tile, GDkOut& gDkOut_tile, SStage& sStage,
+    const float dk_acc[4], const float dkt_acc[4],
+    int T_seq, int i_ti, int tid)
+{
+    static_assert(BC * BK / 4 == NUM_THREADS, "1 chunk/thread expected");
+    int vi = tid;
+    int r = (vi * 4) / BK;
+    int c = (vi * 4) % BK;
+    float4 prev = {0.f, 0.f, 0.f, 0.f};
+    if ((i_ti + r) < T_seq) {
+        prev = *reinterpret_cast<const float4*>(&gDk_tile(r, c));
+    }
+    sStage(r, c + 0) = prev.x;
+    sStage(r, c + 1) = prev.y;
+    sStage(r, c + 2) = prev.z;
+    sStage(r, c + 3) = prev.w;
+    __syncthreads();
+
+    for (int rh = 0; rh < 2; ++rh) {
+        int row, col_base;
+        get_acc_pair_row_col(tid, rh, row, col_base);
+        float2* p = reinterpret_cast<float2*>(&sStage(row, col_base));
+        float2 cur = *p;
+        cur.x += dk_acc[rh * 2 + 0] + dkt_acc[rh * 2 + 0];
+        cur.y += dk_acc[rh * 2 + 1] + dkt_acc[rh * 2 + 1];
+        *p = cur;
+    }
+    __syncthreads();
+
+    if ((i_ti + r) < T_seq) {
+        __nv_bfloat162 lo = __floats2bfloat162_rn(sStage(r, c + 0), sStage(r, c + 1));
+        __nv_bfloat162 hi = __floats2bfloat162_rn(sStage(r, c + 2), sStage(r, c + 3));
+        uint2 packed;
+        packed.x = reinterpret_cast<uint32_t&>(lo);
+        packed.y = reinterpret_cast<uint32_t&>(hi);
+        *reinterpret_cast<uint2*>(&gDkOut_tile(r, c)) = packed;
+    }
+}
+
+}  // namespace sm90_bwd_intra
+
