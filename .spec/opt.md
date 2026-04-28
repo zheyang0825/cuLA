@@ -95,3 +95,32 @@ exp2(gn_i[d] - G[j,d]) = exp2(gn_REF[d] - G[j,d]) * exp2(gn_i[d] - gn_REF[d])
 7. SMEM 重排，确认 ≤ 228KB
 8. 数值验证 vs tests/test_kda_bwd_intra_sm90.py
 9. NCU profile，目标 ≥1.5x FLA
+## 2026 重构记录 (单 WG cp.async 移植)
+
+把原 416 线程 WS 内核（PREP+MMA+Load）整体替换为 feat/bwd2 的
+单 warpgroup（128 线程）cp.async 设计：
+
+* Grid 从 (1 CTA / chunk) 扩展到 (NK*NC=16 CTAs / chunk)
+* SMEM 220.9 KB → 10.6 KB
+* B-operand 在寄存器/SMEM 中按需构造，无 PREP→MMA 跨 WG 转交
+* fp32 输出 (float4 store)，db 用 atomicAdd 在 i_k 维聚合
+
+**性能里程碑** (B=2 H=64 D=128 T=32768)：
+* baseline (旧 WS 内核)：0.25x FLA
+* Phase A (移植) ：0.80x FLA
+* Phase A2 (`__launch_bounds__(128, 8)` → 64 reg 0 spill)：0.86x FLA
+
+**NCU 关键指标 (Phase A2)**：
+* SM Throughput 51%, Memory 70%, L1/TEX 74%, DRAM 16%
+* Achieved Occupancy 40%, Theoretical 44% (受寄存器 64/thread 限制为 7-8 block/SM)
+* Shared store bank conflict 33% potential, shared load 23%
+* Tail effect 20% (4 full + 1 partial wave)
+
+**通向 1.5x 的剩余路径** (待实现)：
+1. **预加载整个 chunk 的 K/G/Q 到 SMEM**（消除 j-loop 中 4× 重复 gmem 取数）。
+   SMEM 增至 ~22 KB，仍够 8 block/SM。预计 1.2-1.4× 提升。
+2. **NK=1 (BK=128)**：每 CTA 处理整个 D=128，CTA 数减为 1/4，
+   消除 db atomicAdd。需 4 套 N-tile acc (16 fp32/thread)。预计 1.3-1.5×。
+3. **cp.async 双缓冲 dA(j+1)** 与 mma(j) 重叠。预计 1.1-1.2×。
+4. **Bank-conflict free epilogue**：直接 register→gmem 的 add（绕过 s_acc 暂存）
+   或者改用 padded-stride 而非 swizzle。预计 1.1-1.3×。
