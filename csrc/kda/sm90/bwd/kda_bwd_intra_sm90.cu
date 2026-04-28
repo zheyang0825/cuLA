@@ -210,7 +210,7 @@ get_acc_row_col(int tid, int v, int& row, int& col) {
 // blockIdx.x: (i_k, i_i)   blockIdx.y: chunk tile id   blockIdx.z: head
 // ============================================================
 __global__ void
-__launch_bounds__(NUM_THREADS) kda_bwd_intra_sm90_kernel(__grid_constant__ const KDA_bwd_intra_params params) {
+__launch_bounds__(NUM_THREADS, 8) kda_bwd_intra_sm90_kernel(__grid_constant__ const KDA_bwd_intra_params params) {
     extern __shared__ char smem_buf[];
     SmemStorage& smem = *reinterpret_cast<SmemStorage*>(smem_buf);
 
