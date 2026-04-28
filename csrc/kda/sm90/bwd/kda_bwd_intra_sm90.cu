@@ -18,6 +18,7 @@
 using namespace cute;
 
 #include "kda/sm90/bwd/kda_config.h"
+#include "kda/sm90/bwd/kda_bwd_intra_helpers.hpp"
 
 // ============================================================
 // Constants
@@ -397,27 +398,12 @@ __launch_bounds__(NUM_THREADS) kda_bwd_intra_kernel_sm90(__grid_constant__ const
                 }
             }
 
-            // Build KG operand from gmem using 4-wide vector loads along contiguous N
+            // Build KG operand from gmem (mirrors sm100 setup_kg_intra)
             {
                 auto gK_j = local_tile(mK, tile_hk, make_coord(j_tile, i_k));
                 auto gG_j = local_tile(mG, tile_hk, make_coord(j_tile, i_k));
-                constexpr int VEC_ELEMS = BC * BK / 4;  // 128
-                for (int vi = tid; vi < VEC_ELEMS; vi += NUM_THREADS) {
-                    int k_dim = (vi * 4) / BK;
-                    int n = (vi * 4) % BK;
-
-                    uint2 k_pack = *reinterpret_cast<const uint2*>(&gK_j(k_dim, n));
-                    __nv_bfloat162 k01 = bitcast_bf162(k_pack.x);
-                    __nv_bfloat162 k23 = bitcast_bf162(k_pack.y);
-                    float2 kf01 = __bfloat1622float2(k01);
-                    float2 kf23 = __bfloat1622float2(k23);
-                    float4 gv = *reinterpret_cast<const float4*>(&gG_j(k_dim, n));
-
-                    sKG(n + 0, k_dim) = kf01.x * exp2f(smem.s_gn[n + 0] - gv.x);
-                    sKG(n + 1, k_dim) = kf01.y * exp2f(smem.s_gn[n + 1] - gv.y);
-                    sKG(n + 2, k_dim) = kf23.x * exp2f(smem.s_gn[n + 2] - gv.z);
-                    sKG(n + 3, k_dim) = kf23.y * exp2f(smem.s_gn[n + 3] - gv.w);
-                }
+                sm90_bwd_intra::setup_kg_intra_offdiag_gmem<BC, BK, NUM_THREADS>(
+                    sKG, gK_j, gG_j, smem.s_gn.data(), tid);
             }
 
             // Wait for cp.async dA + fence KG writes
@@ -477,14 +463,9 @@ __launch_bounds__(NUM_THREADS) kda_bwd_intra_kernel_sm90(__grid_constant__ const
             }
         }
 
-        // Build KG from persistent smem K, G (overlaps TMA)
-        for (int idx = tid; idx < BK * BC; idx += NUM_THREADS) {
-            int n = idx % BK;
-            int k_dim = idx / BK;
-            bool valid = (i_ti + k_dim) < T_seq;
-            float g_diff = valid ? (sG(k_dim, n) - smem.s_gn[n]) : 0.f;
-            sKG(n, k_dim) = valid ? (__bfloat162float(sK(k_dim, n)) * exp2f(-g_diff)) : 0.f;
-        }
+        // Build KG from persistent smem K, G (overlaps cp.async)
+        sm90_bwd_intra::setup_kg_intra_diag<BC, BK, NUM_THREADS>(
+            sKG, sK, sG, smem.s_gn.data(), T_seq, i_ti, tid);
 
         // Wait for cp.async dA + fence KG writes
         asm volatile("cp.async.commit_group;\n");
@@ -666,57 +647,15 @@ __launch_bounds__(NUM_THREADS) kda_bwd_intra_kernel_sm90(__grid_constant__ const
             }
 
             // Build QG = q_j * exp2(g_j - gn) and KBG = k_j * beta_j * exp2(g_j - gn)
-            // using 4-wide vector loads along contiguous N
+            // (mirrors sm100 setup_intra_fused; single G/K/Q load → 2 outputs)
             {
                 auto gQ_j = local_tile(mQ, tile_hk, make_coord(j_tile, i_k));
                 auto gK_j = local_tile(mK, tile_hk, make_coord(j_tile, i_k));
                 auto gG_j = local_tile(mG, tile_hk, make_coord(j_tile, i_k));
                 auto gBeta_j = local_tile(mBeta, Int<BC>{}, j_tile);
-                constexpr int VEC_ELEMS = BC * BK / 4;  // 128
-                for (int vi = tid; vi < VEC_ELEMS; vi += NUM_THREADS) {
-                    int k_dim = (vi * 4) / BK;
-                    int n = (vi * 4) % BK;
-                    bool valid = (j_ti + k_dim) < T_seq;
-                    float bv = valid ? __bfloat162float(gBeta_j(k_dim)) : 0.f;
-
-                    if (valid) {
-                        uint2 q_pack = *reinterpret_cast<const uint2*>(&gQ_j(k_dim, n));
-                        uint2 k_pack = *reinterpret_cast<const uint2*>(&gK_j(k_dim, n));
-                        __nv_bfloat162 q01 = bitcast_bf162(q_pack.x);
-                        __nv_bfloat162 q23 = bitcast_bf162(q_pack.y);
-                        __nv_bfloat162 k01 = bitcast_bf162(k_pack.x);
-                        __nv_bfloat162 k23 = bitcast_bf162(k_pack.y);
-                        float2 qf01 = __bfloat1622float2(q01);
-                        float2 qf23 = __bfloat1622float2(q23);
-                        float2 kf01 = __bfloat1622float2(k01);
-                        float2 kf23 = __bfloat1622float2(k23);
-                        float4 gv = *reinterpret_cast<const float4*>(&gG_j(k_dim, n));
-
-                        float gate0 = exp2f(gv.x - smem.s_gn[n + 0]);
-                        float gate1 = exp2f(gv.y - smem.s_gn[n + 1]);
-                        float gate2 = exp2f(gv.z - smem.s_gn[n + 2]);
-                        float gate3 = exp2f(gv.w - smem.s_gn[n + 3]);
-
-                        sKG(n + 0, k_dim) = qf01.x * gate0;
-                        sKG(n + 1, k_dim) = qf01.y * gate1;
-                        sKG(n + 2, k_dim) = qf23.x * gate2;
-                        sKG(n + 3, k_dim) = qf23.y * gate3;
-
-                        sKBG(n + 0, k_dim) = kf01.x * bv * gate0;
-                        sKBG(n + 1, k_dim) = kf01.y * bv * gate1;
-                        sKBG(n + 2, k_dim) = kf23.x * bv * gate2;
-                        sKBG(n + 3, k_dim) = kf23.y * bv * gate3;
-                    } else {
-                        sKG(n + 0, k_dim) = 0.f;
-                        sKG(n + 1, k_dim) = 0.f;
-                        sKG(n + 2, k_dim) = 0.f;
-                        sKG(n + 3, k_dim) = 0.f;
-                        sKBG(n + 0, k_dim) = 0.f;
-                        sKBG(n + 1, k_dim) = 0.f;
-                        sKBG(n + 2, k_dim) = 0.f;
-                        sKBG(n + 3, k_dim) = 0.f;
-                    }
-                }
+                sm90_bwd_intra::setup_intra_fused_offdiag_gmem<BC, BK, NUM_THREADS>(
+                    sKG, sKBG, gQ_j, gK_j, gG_j, gBeta_j,
+                    smem.s_gn.data(), T_seq, j_ti, tid);
             }
             __syncthreads();
 
@@ -772,17 +711,11 @@ __launch_bounds__(NUM_THREADS) kda_bwd_intra_kernel_sm90(__grid_constant__ const
             }
         }
 
-        // Build Q_exp = q * exp2(g - gn), KB_exp = k * beta * exp2(g - gn) from persistent smem
-        for (int idx = tid; idx < BK * BC; idx += NUM_THREADS) {
-            int n = idx % BK;
-            int k_dim = idx / BK;
-            bool valid = (i_ti + k_dim) < T_seq;
-            float g_diff = valid ? (sG(k_dim, n) - smem.s_gn[n]) : 0.f;
-            float exp_g = valid ? exp2f(g_diff) : 0.f;
-            sKG(n, k_dim) = valid ? __bfloat162float(sQ(k_dim, n)) * exp_g : 0.f;
-            float kv = valid ? __bfloat162float(sK(k_dim, n)) : 0.f;
-            sKBG(n, k_dim) = kv * smem.s_beta[k_dim] * exp_g;
-        }
+        // Build QG, KBG from persistent smem (mirrors sm100 setup_intra_fused)
+        sm90_bwd_intra::setup_intra_fused_diag<BC, BK, NUM_THREADS>(
+            sQG, sKBG, sQ, sK, sG,
+            smem.s_beta.data(), smem.s_gn.data(),
+            T_seq, i_ti, tid);
         __syncthreads();
 
         float tmp_q[4] = {0.f, 0.f, 0.f, 0.f};
