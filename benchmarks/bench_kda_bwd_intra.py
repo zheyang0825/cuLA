@@ -20,10 +20,16 @@ import sys
 import torch
 import triton
 
-sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+REPO_ROOT = pathlib.Path(__file__).parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+sys.path.insert(0, str(REPO_ROOT / "third_party" / "flash-linear-attention"))
+HOPPER_SITE_PACKAGES = REPO_ROOT / ".venv" / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+if HOPPER_SITE_PACKAGES.is_dir():
+    sys.path.insert(0, str(HOPPER_SITE_PACKAGES))
 os.environ.setdefault("FLA_USE_FAST_OPS", os.getenv("CULA_USE_FAST_MATH", "1"))  # Enable fast ops in FLA for fair comparison
 
 from fla.ops.kda.chunk_intra import chunk_kda_bwd_intra as fla_chunk_kda_bwd_intra
+from kda import kda_bwd_intra as hopper_chunk_kda_bwd_intra
 
 import cula.cudac as C
 from benchmarks.utils import SEED, exclusive_cumsum, generate_random_seq_lens, set_seed
@@ -79,12 +85,20 @@ def prepare_bwd_intra_inputs(total_len, H, D, device, cu_seqlens, chunk_size=BT,
     dk_out = torch.empty(1, total_len, H, D, device=device, dtype=torch.bfloat16)
     db_out = torch.empty(NK, 1, total_len, H, device=device, dtype=torch.float32)
     dg_out = torch.empty(1, total_len, H, D, device=device, dtype=torch.float32)
+    hopper_dq_out = torch.empty(1, total_len, H, D, device=device, dtype=torch.bfloat16)
+    hopper_dk_out = torch.empty(1, total_len, H, D, device=device, dtype=torch.bfloat16)
+    hopper_db_out = torch.empty(1, total_len, H, device=device, dtype=torch.float32)
+    hopper_dg_out = torch.empty(1, total_len, H, D, device=device, dtype=torch.float32)
+    hopper_tile_counter = torch.zeros(1, device=device, dtype=torch.int32)
 
     return dict(
         q=q, k=k, g=g, beta=beta,
         dAqk=dAqk, dAkk=dAkk, dq=dq, dk=dk, db=db, dg=dg,
         cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
         dq_out=dq_out, dk_out=dk_out, db_out=db_out, dg_out=dg_out,
+        hopper_dq_out=hopper_dq_out, hopper_dk_out=hopper_dk_out,
+        hopper_db_out=hopper_db_out, hopper_dg_out=hopper_dg_out,
+        hopper_tile_counter=hopper_tile_counter,
         chunk_size=chunk_size, NK=NK,
     )
 
@@ -109,6 +123,17 @@ def run_fla(data):
         chunk_indices=data["chunk_indices"],
         chunk_size=data["chunk_size"],
         safe_gate=True,
+    )
+
+
+def run_hopper(data):
+    """Run kda_bwd_hopper CUDA kernel."""
+    return hopper_chunk_kda_bwd_intra(
+        data["q"], data["k"], data["g"], data["beta"],
+        data["dAqk"], data["dAkk"], data["dq"], data["dk"], data["db"], data["dg"],
+        data["cu_seqlens"], data["chunk_indices"],
+        data["hopper_dq_out"], data["hopper_dk_out"], data["hopper_db_out"], data["hopper_dg_out"],
+        data["chunk_size"], data["hopper_tile_counter"],
     )
 
 
@@ -137,6 +162,30 @@ def compare_outputs(data):
     return stats
 
 
+def compare_hopper_outputs(data):
+    """Run hopper and compare against FLA. Returns (rmse_dq, rmse_dk, rmse_db, rmse_dg)."""
+    data["hopper_dq_out"].zero_()
+    data["hopper_dk_out"].zero_()
+    data["hopper_db_out"].zero_()
+    data["hopper_dg_out"].zero_()
+    data["hopper_tile_counter"].zero_()
+    dq_hopper, dk_hopper, db_hopper, dg_hopper = run_hopper(data)
+    torch.cuda.synchronize()
+
+    dq_fla, dk_fla, db_fla, dg_fla = run_fla(data)
+
+    stats = {}
+    for name, ref, tri in [
+        ("dq", dq_fla, dq_hopper),
+        ("dk", dk_fla, dk_hopper),
+        ("db", db_fla, db_hopper),
+        ("dg", dg_fla, dg_hopper),
+    ]:
+        stats[name] = accuracy_stats(ref, tri)
+
+    return stats
+
+
 # ==============================================================================
 # Uniform seqlen benchmark
 # ==============================================================================
@@ -146,14 +195,16 @@ def benchmark_bwd_intra_uniform():
     T_vals = [512, 1024, 4096, 8192, 16384, 32768]
     T_vals_b1 = [65536, 131072]  # Use B=1 for very large sequences
 
-    print("=" * 100)
-    print(f"  Uniform-Length BwdIntra Benchmark: cuLA vs FLA Triton  H={H} D={D}")
-    print("=" * 100)
+    print("=" * 161)
+    print(f"  Uniform-Length BwdIntra Benchmark: FLA vs cuLA vs kda_bwd_hopper  H={H} D={D}")
+    print("=" * 161)
     print(
-        f"{'B':>4} {'T':>7} │ {'dq_rmse':>10} {'dk_rmse':>10} {'db_rmse':>10} {'dg_rmse':>10}"
-        f" │ {'FLA(ms)':>9} {'cuLA(ms)':>9} {'Speedup':>8}"
+        f"{'B':>4} {'T':>7} │ "
+        f"{'cuLA_dq':>10} {'cuLA_dk':>10} {'cuLA_db':>10} {'cuLA_dg':>10} │ "
+        f"{'hopper_dq':>10} {'hopper_dk':>10} {'hopper_db':>10} {'hopper_dg':>10} │ "
+        f"{'FLA(ms)':>9} {'cuLA(ms)':>9} {'hopper(ms)':>11} {'cuLA_spd':>9} {'hop_spd':>8}"
     )
-    print("─" * 100)
+    print("─" * 161)
 
     all_configs = [(B, T) for T in T_vals] + [(1, T) for T in T_vals_b1]
     for b, T in all_configs:
@@ -165,26 +216,30 @@ def benchmark_bwd_intra_uniform():
 
         # Accuracy
         stats = compare_outputs(data)
+        hopper_stats = compare_hopper_outputs(data)
 
         # Performance: FLA
         ms_fla = triton.testing.do_bench(lambda: run_fla(data))
 
         # Performance: cuLA
         ms_cula = triton.testing.do_bench(lambda: run_cula(data))
+        ms_hopper = triton.testing.do_bench(lambda: run_hopper(data))
 
         speedup = ms_fla / ms_cula if ms_cula > 0 else float("inf")
+        hopper_speedup = ms_fla / ms_hopper if ms_hopper > 0 else float("inf")
 
         print(
             f"{b:>4} {T:>7} │ "
-            f"{stats['dq'][0]:>10.6f} {stats['dk'][0]:>10.6f} {stats['db'][0]:>10.6f} {stats['dg'][0]:>10.6f}"
-            f" │ {ms_fla:>9.4f} {ms_cula:>9.4f} {speedup:>7.2f}x"
+            f"{stats['dq'][0]:>10.6f} {stats['dk'][0]:>10.6f} {stats['db'][0]:>10.6f} {stats['dg'][0]:>10.6f} │ "
+            f"{hopper_stats['dq'][0]:>10.6f} {hopper_stats['dk'][0]:>10.6f} {hopper_stats['db'][0]:>10.6f} {hopper_stats['dg'][0]:>10.6f}"
+            f" │ {ms_fla:>9.4f} {ms_cula:>9.4f} {ms_hopper:>11.4f} {speedup:>8.2f}x {hopper_speedup:>7.2f}x"
         )
 
         # Free large tensors between sizes
         del data
         torch.cuda.synchronize()
 
-    print("─" * 100)
+    print("─" * 161)
 
 
 # ==============================================================================
@@ -196,14 +251,16 @@ def benchmark_bwd_intra_varlen():
     total_len_vals = [8192, 16384, 32768, 65536, 131072]
 
     print()
-    print("=" * 110)
-    print(f"  Varlen BwdIntra Benchmark: cuLA vs FLA Triton  NUM_SEQS={NUM_SEQS} H={H} D={D}")
-    print("=" * 110)
+    print("=" * 164)
+    print(f"  Varlen BwdIntra Benchmark: FLA vs cuLA vs kda_bwd_hopper  NUM_SEQS={NUM_SEQS} H={H} D={D}")
+    print("=" * 164)
     print(
-        f"{'total_len':>10} │ {'dq_rmse':>10} {'dk_rmse':>10} {'db_rmse':>10} {'dg_rmse':>10}"
-        f" │ {'FLA(ms)':>9} {'cuLA(ms)':>9} {'Speedup':>8}"
+        f"{'total_len':>10} │ "
+        f"{'cuLA_dq':>10} {'cuLA_dk':>10} {'cuLA_db':>10} {'cuLA_dg':>10} │ "
+        f"{'hopper_dq':>10} {'hopper_dk':>10} {'hopper_db':>10} {'hopper_dg':>10} │ "
+        f"{'FLA(ms)':>9} {'cuLA(ms)':>9} {'hopper(ms)':>11} {'cuLA_spd':>9} {'hop_spd':>8}"
     )
-    print("─" * 110)
+    print("─" * 164)
 
     for total_len in total_len_vals:
         seq_lens = generate_random_seq_lens(NUM_SEQS, total_len, MIN_SEQ_LEN, VARIANCE, SEED)
@@ -213,25 +270,29 @@ def benchmark_bwd_intra_varlen():
 
         # Accuracy
         stats = compare_outputs(data)
+        hopper_stats = compare_hopper_outputs(data)
 
         # Performance: FLA
         ms_fla = triton.testing.do_bench(lambda: run_fla(data))
 
         # Performance: cuLA
         ms_cula = triton.testing.do_bench(lambda: run_cula(data))
+        ms_hopper = triton.testing.do_bench(lambda: run_hopper(data))
 
         speedup = ms_fla / ms_cula if ms_cula > 0 else float("inf")
+        hopper_speedup = ms_fla / ms_hopper if ms_hopper > 0 else float("inf")
 
         print(
             f"{total_len:>10} │ "
-            f"{stats['dq'][0]:>10.6f} {stats['dk'][0]:>10.6f} {stats['db'][0]:>10.6f} {stats['dg'][0]:>10.6f}"
-            f" │ {ms_fla:>9.4f} {ms_cula:>9.4f} {speedup:>7.2f}x"
+            f"{stats['dq'][0]:>10.6f} {stats['dk'][0]:>10.6f} {stats['db'][0]:>10.6f} {stats['dg'][0]:>10.6f} │ "
+            f"{hopper_stats['dq'][0]:>10.6f} {hopper_stats['dk'][0]:>10.6f} {hopper_stats['db'][0]:>10.6f} {hopper_stats['dg'][0]:>10.6f}"
+            f" │ {ms_fla:>9.4f} {ms_cula:>9.4f} {ms_hopper:>11.4f} {speedup:>8.2f}x {hopper_speedup:>7.2f}x"
         )
 
         del data
         torch.cuda.synchronize()
 
-    print("─" * 110)
+    print("─" * 164)
 
 
 if __name__ == "__main__":
