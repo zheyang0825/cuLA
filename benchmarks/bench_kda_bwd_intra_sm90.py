@@ -2,7 +2,7 @@
 # Copyright 2025-2026 Ant Group Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Benchmark and determinism stress test for the CUDA/CuTe SM90 bwd-intra kernel.
+"""Benchmark and determinism stress test for the persistent CUDA SM90 bwd-intra kernel.
 
 The kernel uses warp-level ``mma.sync.m16n8k8`` and can also run on
 SM100/SM103. This script calls the low-level kernel directly so the same

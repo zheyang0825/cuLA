@@ -78,7 +78,7 @@ ChunkKDABwdIntra(
 
     TORCH_CHECK(q.scalar_type() == at::kBFloat16, "q must be bfloat16");
     TORCH_CHECK(k.scalar_type() == at::kBFloat16, "k must be bfloat16");
-    TORCH_CHECK(beta.scalar_type() == at::kBFloat16, "beta must be bfloat16");
+    TORCH_CHECK(beta.scalar_type() == at::kFloat, "beta must be float32");
     TORCH_CHECK(dq_out.scalar_type() == at::kBFloat16, "dq_out must be bfloat16");
     TORCH_CHECK(dk_out.scalar_type() == at::kBFloat16, "dk_out must be bfloat16");
     for (auto const& item : {
@@ -119,10 +119,7 @@ ChunkKDABwdIntra(
     TORCH_CHECK(cu_seqlens.dim() == 1 && cu_seqlens.numel() >= 2, "cu_seqlens must have shape [num_sequences + 1]");
     TORCH_CHECK(
         chunk_indices.dim() == 2 && chunk_indices.size(1) == 2, "chunk_indices must have shape [num_chunks, 2]");
-    TORCH_CHECK(
-        db_out.dim() == 4 && db_out.size(0) == 4 && db_out.size(1) == beta.size(0) && db_out.size(2) == beta.size(1) &&
-            db_out.size(3) == beta.size(2),
-        "db_out must have shape [4, B, T, H]");
+    TORCH_CHECK(db_out.sizes() == beta.sizes(), "db_out must have the same shape as beta");
 
     TORCH_CHECK(chunk_size == 64, "chunk_kda_bwd_intra_cuda supports only chunk_size=64, got ", chunk_size);
     TORCH_CHECK(q.size(3) == 128, "chunk_kda_bwd_intra_cuda supports only K=128, got ", q.size(3));
@@ -154,16 +151,13 @@ ChunkKDABwdIntra(
     params.dk_out_ptr = dk_out.data_ptr();
     params.db_out_ptr = db_out.data_ptr();
     params.dg_out_ptr = dg_out.data_ptr();
+    params.num_chunks = static_cast<int>(chunk_indices.size(0));
+    params.num_k_tiles = params.d / 32;
 
-    constexpr int kBlockK = 32;
-    constexpr int kBlockC = 16;
-    params.tile_scheduler_params = NaiveTileScheduler::Params{
-        static_cast<int>(chunk_indices.size(0)),
-        params.h,
-        params.d / kBlockK,
-        params.chunk_size / kBlockC,
-    };
+    auto db_partials = at::zeros({params.num_k_tiles, beta.size(0), beta.size(1), beta.size(2)}, db.options());
+    params.db2_ptr = db_partials.data_ptr();
 
     sm90::run_kda_bwd_intra_sm90(params, at::cuda::getCurrentCUDAStream());
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+    db_out.copy_(db_partials.sum(0).add_(db));
 }

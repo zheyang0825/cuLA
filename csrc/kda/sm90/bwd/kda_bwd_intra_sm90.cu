@@ -1,752 +1,845 @@
-#include <math.h>
+// KDA backward intra-chunk kernel for SM90 (Hopper) - v16
+// 128 threads (4 warps), each warp handles one sub-chunk
+// dA matrices cached in shared memory across K-iterations
+// Persistent kernel: eliminates wave quantization overhead
 
-#include <cuda.h>
+#include <cstdint>
+
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
-#include <cute/algorithm/gemm.hpp>
-#include <cute/arch/cluster_sm90.hpp>
-#include <cute/arch/copy_sm90_tma.hpp>
-#include <cute/atom/copy_atom.hpp>
-#include <cute/atom/copy_traits_sm90_tma.hpp>
-#include <cute/atom/mma_atom.hpp>
-#include <cute/swizzle_layout.hpp>
-#include <cute/tensor.hpp>
-#include <cutlass/arch/barrier.h>
-#include <cutlass/bfloat16.h>
-
-using namespace cute;
-
-#include "kda/sm90/bwd/kda_bwd_intra_helpers.hpp"
 #include "kda/sm90/bwd/kda_config.h"
 
-// ============================================================
-// Constants
-// ============================================================
-static constexpr int BC = 16;
-static constexpr int BK = 32;
-static constexpr int BT = 64;
-static constexpr int NC = 4;  // BT / BC
-static constexpr int NK = 4;  // K / BK (K=128 assumed)
-static constexpr int NUM_THREADS = 128;
+namespace sm90 {
 
-// ============================================================
-// CuTe type aliases
-// ============================================================
+constexpr int BT = 64;
+constexpr int BC = 16;
+constexpr int BK = 32;
+constexpr int K_SIZE = 128;
+constexpr int NC = BT / BC;
+constexpr int NK = K_SIZE / BK;
+constexpr int WARP_SIZE = 32;
+constexpr int BLOCK_THREADS = NC * WARP_SIZE;
+constexpr int NT = BK / 8;
+constexpr uint32_t TF32_MASK = 0xFFFFE000u;
+constexpr int BK_S = BK + 4;
+constexpr int BT_S = BT + 4;
 
-// SM80 TF32 MMA: 16x8x8, TN layout. Tiled across 4 warps in N.
-using MMA_Atom_TF32 = MMA_Atom<SM80_16x8x8_F32TF32TF32F32_TN>;
-using TiledMMA_t = TiledMMA<MMA_Atom_TF32, Layout<Shape<_1, _4, _1>>>;
-// Tiled shape: M=16, N=32, K=8. For K=16 we iterate k=0,1.
-
-// SMEM layouts (row-major, col stride-1)
-// [16,32] bf16, row_bytes=64B → Swizzle<2,3,3>, loaded via cp.async
-using SmemLayoutQK = decltype(composition(Swizzle<2, 3, 3>{}, Layout<Shape<Int<BC>, Int<BK>>, Stride<Int<BK>, _1>>{}));
-// [16,32] fp32, row_bytes=128B → Swizzle<3,2,3> (128B mode), loaded via cooperative copy
-using SmemLayoutG = decltype(composition(Swizzle<3, 2, 3>{}, Layout<Shape<Int<BC>, Int<BK>>, Stride<Int<BK>, _1>>{}));
-// [16,16] fp32, row_bytes=64B → Swizzle<2,2,3>, loaded via cp.async (Phase 1) / cooperative (Phase 2)
-using SmemLayoutDA = decltype(composition(Swizzle<2, 2, 3>{}, Layout<Shape<Int<BC>, Int<BC>>, Stride<Int<BC>, _1>>{}));
-// [32,16] fp32, padded stride 17 → gcd(17,32)=1 → zero bank conflicts for both row/col access
-using SmemLayoutB_op = Layout<Shape<Int<BK>, Int<BC>>, Stride<Int<BC + 1>, _1>>;
-// [16,32] fp32, row_bytes=128B → Swizzle<3,2,3> (128B mode)
-using SmemLayoutAcc = decltype(composition(Swizzle<3, 2, 3>{}, Layout<Shape<Int<BC>, Int<BK>>, Stride<Int<BK>, _1>>{}));
-
-// S2R atoms for MMA operand loads
-// A (dA): ldmatrix.x4 — 1 warp instruction loads [16,8] floats (4 regs/thread)
-using S2RAtomA = Copy_Atom<SM75_U32x4_LDSM_N, float>;
-// B (KG): scalar shared load — stride-17 padding gives 0 bank conflicts
-using S2RAtomB = Copy_Atom<UniversalCopy<float>, float>;
-
-// ============================================================
-// Shared memory
-// ============================================================
-struct SmemStorage {
-    array_aligned<__nv_bfloat16, cosize_v<SmemLayoutQK>, 128> s_q;  // [16,32] persistent bf16
-    array_aligned<__nv_bfloat16, cosize_v<SmemLayoutQK>, 128> s_k;  // [16,32] persistent bf16
-    array_aligned<float, cosize_v<SmemLayoutG>, 128> s_g;           // [16,32] persistent fp32
-    array_aligned<float, BC> s_beta;                                // [16]    persistent
-    array_aligned<float, BK> s_gn;                                  // [32]    gate anchor
-    array_aligned<float, cosize_v<SmemLayoutDA>, 128> s_dA_qk;      // [16,16] per-iter
-    array_aligned<float, cosize_v<SmemLayoutDA>, 128> s_dA_kk;      // [16,16] per-iter
-    array_aligned<float, cosize_v<SmemLayoutB_op>> s_KG;            // [32,16] Phase1: KG, Phase2: QG
-    union {
-        array_aligned<float, cosize_v<SmemLayoutB_op>> s_KBG;  // Phase 2: KBG operand
-        array_aligned<float, cosize_v<SmemLayoutAcc>> s_acc;   // Phase 1: db reduction scratch
-    };
-    array_aligned<float, BC> s_db;  // [16] db output
+struct WarpWork {
+    float B_a[BC][BK_S];
+    float B_b[BC][BK_S];
 };
 
-// ============================================================
-// MMA helper: acc += A[16,16] @ B[32,16]^T → C[16,32]
-// Follows sgemm_sm80 pattern: s2r copy with retile_D
-// ============================================================
+struct SmemLayout {
+    __nv_bfloat16 q_s[BT][BK];
+    __nv_bfloat16 k_s[BT][BK];
+    float g_s[BT][BK_S];
+    float beta_s[BT];
+    float dAqk_cache[BT][BT_S];
+    float dAkk_cache[BT][BT_S];
+    WarpWork ww[NC];
+    int s_tile_id;
+};
+
 __device__ __forceinline__ void
-gemm_m16n32k16(const float* s_A, const float* s_Bop, float acc[4], int tid) {
-    TiledMMA_t tiled_mma;
-    auto sA = make_tensor(make_smem_ptr(s_A), SmemLayoutDA{});      // (16,16)
-    auto sB = make_tensor(make_smem_ptr(s_Bop), SmemLayoutB_op{});  // (32,16)
-
-    auto thr_mma = tiled_mma.get_slice(tid);
-    auto tCrA = thr_mma.partition_fragment_A(sA);  // (MMA, MMA_M, MMA_K)
-    auto tCrB = thr_mma.partition_fragment_B(sB);  // (MMA, MMA_N, MMA_K)
-
-    // Accumulator: create using a [16,32] shape for C
-    auto sC_dummy = make_tensor(make_smem_ptr(s_A), SmemLayoutAcc{});
-    auto tCrC = thr_mma.partition_fragment_C(sC_dummy);
-
-    CUTE_UNROLL
-    for (int i = 0; i < size(tCrC); ++i) {
-        tCrC(i) = acc[i];
-    }
-
-    auto s2r_copy_a = make_tiled_copy_A(S2RAtomA{}, tiled_mma);
-    auto s2r_copy_b = make_tiled_copy_B(S2RAtomB{}, tiled_mma);
-    auto thr_s2r_a = s2r_copy_a.get_slice(tid);
-    auto thr_s2r_b = s2r_copy_b.get_slice(tid);
-
-    auto tXsA = thr_s2r_a.partition_S(sA);
-    auto tXrA = thr_s2r_a.retile_D(tCrA);
-    auto tXsB = thr_s2r_b.partition_S(sB);
-    auto tXrB = thr_s2r_b.retile_D(tCrB);
-
-    // K-loop: K=16 / atom_K=8 = 2 iterations
-    auto K_BLOCK_MAX = size<2>(tCrA);
-    CUTE_UNROLL
-    for (int k = 0; k < K_BLOCK_MAX; ++k) {
-        copy(s2r_copy_a, tXsA(_, _, k), tXrA(_, _, k));
-        copy(s2r_copy_b, tXsB(_, _, k), tXrB(_, _, k));
-        gemm(tiled_mma, tCrA(_, _, k), tCrB(_, _, k), tCrC);
-    }
-
-    CUTE_UNROLL
-    for (int i = 0; i < size(tCrC); ++i) {
-        acc[i] = tCrC(i);
-    }
+cp_async_16(void* smem, const void* global) {
+    uint32_t sa = __cvta_generic_to_shared(smem);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(sa), "l"(global));
 }
-
-// ============================================================
-// Fused dual-GEMM with shared B:
-//   acc1 += A1 @ B^T,  acc2 += A2 @ B^T
-// B operand S2R load done once per k-step, saving half B bandwidth.
-// ============================================================
 __device__ __forceinline__ void
-gemm_m16n32k16_shared_b(
-    const float* s_A1, const float* s_A2, const float* s_Bop, float acc1[4], float acc2[4], int tid) {
-    TiledMMA_t tiled_mma;
-    auto thr_mma = tiled_mma.get_slice(tid);
-
-    auto sB = make_tensor(make_smem_ptr(s_Bop), SmemLayoutB_op{});
-    auto sA1 = make_tensor(make_smem_ptr(s_A1), SmemLayoutDA{});
-    auto sA2 = make_tensor(make_smem_ptr(s_A2), SmemLayoutDA{});
-
-    auto tCrB = thr_mma.partition_fragment_B(sB);
-    auto tCrA1 = thr_mma.partition_fragment_A(sA1);
-    auto tCrA2 = thr_mma.partition_fragment_A(sA2);
-
-    auto sC_dummy = make_tensor(make_smem_ptr(s_A1), SmemLayoutAcc{});
-    auto tCrC1 = thr_mma.partition_fragment_C(sC_dummy);
-    auto tCrC2 = thr_mma.partition_fragment_C(sC_dummy);
-
-    CUTE_UNROLL
-    for (int i = 0; i < size(tCrC1); ++i) {
-        tCrC1(i) = acc1[i];
-        tCrC2(i) = acc2[i];
-    }
-
-    auto s2r_copy_a = make_tiled_copy_A(S2RAtomA{}, tiled_mma);
-    auto s2r_copy_b = make_tiled_copy_B(S2RAtomB{}, tiled_mma);
-    auto thr_s2r_a = s2r_copy_a.get_slice(tid);
-    auto thr_s2r_b = s2r_copy_b.get_slice(tid);
-
-    auto tXsB = thr_s2r_b.partition_S(sB);
-    auto tXrB = thr_s2r_b.retile_D(tCrB);
-    auto tXsA1 = thr_s2r_a.partition_S(sA1);
-    auto tXrA1 = thr_s2r_a.retile_D(tCrA1);
-    auto tXsA2 = thr_s2r_a.partition_S(sA2);
-    auto tXrA2 = thr_s2r_a.retile_D(tCrA2);
-
-    CUTE_UNROLL
-    for (int k = 0; k < size<2>(tCrA1); ++k) {
-        copy(s2r_copy_b, tXsB(_, _, k), tXrB(_, _, k));  // B loaded once
-        copy(s2r_copy_a, tXsA1(_, _, k), tXrA1(_, _, k));
-        gemm(tiled_mma, tCrA1(_, _, k), tCrB(_, _, k), tCrC1);
-        copy(s2r_copy_a, tXsA2(_, _, k), tXrA2(_, _, k));
-        gemm(tiled_mma, tCrA2(_, _, k), tCrB(_, _, k), tCrC2);
-    }
-
-    CUTE_UNROLL
-    for (int i = 0; i < size(tCrC1); ++i) {
-        acc1[i] = tCrC1(i);
-        acc2[i] = tCrC2(i);
-    }
+cp_async_8(void* smem, const void* global) {
+    uint32_t sa = __cvta_generic_to_shared(smem);
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n" ::"r"(sa), "l"(global));
 }
-
-__device__ __forceinline__ __nv_bfloat162
-bitcast_bf162(uint32_t x) {
-    return reinterpret_cast<__nv_bfloat162&>(x);
+__device__ __forceinline__ float
+bf2f(__nv_bfloat16 x) {
+    return __bfloat162float(x);
 }
-
-// ============================================================
-// Per-thread accumulator → (row, col) mapping
-// SM80_16x8x8 CLayout = SM80_16x8_Row (column-major in MxN tile):
-//   pos = m + n * 16 (NOT row-major m * 8 + n)
-//   PTX m16n8k8 f32 mapping:
-//     GroupID = lane / 4 → base row
-//     ThreadInGroup = lane % 4 → base col pair
-//     reg[v]: row = GroupID + (v/2)*8, col = ThreadInGroup*2 + (v%2)
-// ============================================================
+__device__ __forceinline__ float4
+load_bf16x4(const __nv_bfloat16* p) {
+    __nv_bfloat16 tmp[4];
+    *reinterpret_cast<uint2*>(tmp) = *reinterpret_cast<const uint2*>(p);
+    return {__bfloat162float(tmp[0]), __bfloat162float(tmp[1]), __bfloat162float(tmp[2]), __bfloat162float(tmp[3])};
+}
 __device__ __forceinline__ void
-get_acc_row_col(int tid, int v, int& row, int& col) {
-    int lane = tid % 32;
-    int warp_id = tid / 32;
-    row = (lane / 4) + (v / 2) * 8;
-    col = (lane % 4) * 2 + (v % 2) + warp_id * 8;
+cp_async_commit() {
+    asm volatile("cp.async.commit_group;\n");
 }
-
-// Per-thread "pair" base position (rh in {0,1}): two adjacent fp32 acc values
-// (v=2*rh, v=2*rh+1) live at (row, col_base..col_base+1). Use this to issue
-// 8B-aligned float2 LDS/STS in epilogues — replaces 4 scalar scatter writes.
 __device__ __forceinline__ void
-get_acc_pair_row_col(int tid, int rh, int& row, int& col_base) {
-    int lane = tid % 32;
-    int warp_id = tid / 32;
-    row = (lane / 4) + rh * 8;
-    col_base = (lane % 4) * 2 + warp_id * 8;
+cp_async_wait_all() {
+    asm volatile("cp.async.wait_group 0;\n");
+}
+__device__ __forceinline__ void
+st_global_cg_u32(void* addr, uint32_t val) {
+    asm volatile("st.global.cg.u32 [%0], %1;\n" ::"l"(addr), "r"(val));
+}
+__device__ __forceinline__ void
+st_global_cg_f32(void* addr, float val) {
+    asm volatile("st.global.cg.f32 [%0], %1;\n" ::"l"(addr), "f"(val));
+}
+__device__ __forceinline__ void
+st_global_cg_f32x2(void* addr, float v0, float v1) {
+    asm volatile("st.global.cg.v2.f32 [%0], {%1, %2};\n" ::"l"(addr), "f"(v0), "f"(v1));
 }
 
-// ============================================================
-// Main kernel
-// ============================================================
+__device__ __forceinline__ void
+mma_m16n8k8_acc(
+    float& c0,
+    float& c1,
+    float& c2,
+    float& c3,
+    uint32_t a0,
+    uint32_t a1,
+    uint32_t a2,
+    uint32_t a3,
+    uint32_t b0,
+    uint32_t b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ void
+matmul_1warp_2A_from_cache(
+    float acc1[],
+    float acc2[],
+    const float cacheA1[][BT_S],
+    const float cacheA2[][BT_S],
+    int row_off,
+    int col_off,
+    const float B[][BK_S],
+    int gid,
+    int tid_in_grp,
+    bool apply_mask,
+    int sub_seq_len) {
+    float a1[8], a2[8];
+#pragma unroll
+    for (int kk = 0; kk < 2; kk++) {
+        const int a_col = kk * 8 + 2 * tid_in_grp;
+        a1[kk * 4 + 0] = cacheA1[row_off + gid][col_off + a_col];
+        a1[kk * 4 + 1] = cacheA1[row_off + gid + 8][col_off + a_col];
+        a1[kk * 4 + 2] = cacheA1[row_off + gid][col_off + a_col + 1];
+        a1[kk * 4 + 3] = cacheA1[row_off + gid + 8][col_off + a_col + 1];
+        a2[kk * 4 + 0] = cacheA2[row_off + gid][col_off + a_col];
+        a2[kk * 4 + 1] = cacheA2[row_off + gid + 8][col_off + a_col];
+        a2[kk * 4 + 2] = cacheA2[row_off + gid][col_off + a_col + 1];
+        a2[kk * 4 + 3] = cacheA2[row_off + gid + 8][col_off + a_col + 1];
+        if (apply_mask) {
+            int col0 = a_col, col1 = a_col + 1;
+            if (!(col0 <= gid && gid < sub_seq_len && col0 < sub_seq_len)) {
+                a1[kk * 4 + 0] = 0.0f;
+                a2[kk * 4 + 0] = 0.0f;
+            }
+            if (!(col0 <= gid + 8 && gid + 8 < sub_seq_len && col0 < sub_seq_len)) {
+                a1[kk * 4 + 1] = 0.0f;
+                a2[kk * 4 + 1] = 0.0f;
+            }
+            if (!(col1 <= gid && gid < sub_seq_len && col1 < sub_seq_len)) {
+                a1[kk * 4 + 2] = 0.0f;
+                a2[kk * 4 + 2] = 0.0f;
+            }
+            if (!(col1 <= gid + 8 && gid + 8 < sub_seq_len && col1 < sub_seq_len)) {
+                a1[kk * 4 + 3] = 0.0f;
+                a2[kk * 4 + 3] = 0.0f;
+            }
+        }
+        a1[kk * 4 + 0] = __uint_as_float(__float_as_uint(a1[kk * 4 + 0]) & TF32_MASK);
+        a1[kk * 4 + 1] = __uint_as_float(__float_as_uint(a1[kk * 4 + 1]) & TF32_MASK);
+        a1[kk * 4 + 2] = __uint_as_float(__float_as_uint(a1[kk * 4 + 2]) & TF32_MASK);
+        a1[kk * 4 + 3] = __uint_as_float(__float_as_uint(a1[kk * 4 + 3]) & TF32_MASK);
+        a2[kk * 4 + 0] = __uint_as_float(__float_as_uint(a2[kk * 4 + 0]) & TF32_MASK);
+        a2[kk * 4 + 1] = __uint_as_float(__float_as_uint(a2[kk * 4 + 1]) & TF32_MASK);
+        a2[kk * 4 + 2] = __uint_as_float(__float_as_uint(a2[kk * 4 + 2]) & TF32_MASK);
+        a2[kk * 4 + 3] = __uint_as_float(__float_as_uint(a2[kk * 4 + 3]) & TF32_MASK);
+    }
+#pragma unroll
+    for (int nt = 0; nt < NT; nt++) {
+        const int n_base = nt << 3;
+#pragma unroll
+        for (int kk = 0; kk < 2; kk++) {
+            const int b_k = kk * 8 + 2 * tid_in_grp;
+            uint32_t ub0 = __float_as_uint(B[b_k][n_base + gid]) & TF32_MASK;
+            uint32_t ub1 = __float_as_uint(B[b_k + 1][n_base + gid]) & TF32_MASK;
+            mma_m16n8k8_acc(
+                acc1[nt * 4],
+                acc1[nt * 4 + 1],
+                acc1[nt * 4 + 2],
+                acc1[nt * 4 + 3],
+                __float_as_uint(a1[kk * 4 + 0]),
+                __float_as_uint(a1[kk * 4 + 1]),
+                __float_as_uint(a1[kk * 4 + 2]),
+                __float_as_uint(a1[kk * 4 + 3]),
+                ub0,
+                ub1);
+            mma_m16n8k8_acc(
+                acc2[nt * 4],
+                acc2[nt * 4 + 1],
+                acc2[nt * 4 + 2],
+                acc2[nt * 4 + 3],
+                __float_as_uint(a2[kk * 4 + 0]),
+                __float_as_uint(a2[kk * 4 + 1]),
+                __float_as_uint(a2[kk * 4 + 2]),
+                __float_as_uint(a2[kk * 4 + 3]),
+                ub0,
+                ub1);
+        }
+    }
+}
+
+__device__ __forceinline__ void
+matmul_1warp_2B_transA_from_cache(
+    float acc[],
+    const float cacheA1[][BT_S],
+    const float cacheA2[][BT_S],
+    int row_off,
+    int col_off,
+    const float B_x[][BK_S],
+    const float B_y[][BK_S],
+    int gid,
+    int tid_in_grp,
+    bool apply_mask,
+    int sub_seq_len) {
+    {
+        float a[8];
+#pragma unroll
+        for (int kk = 0; kk < 2; kk++) {
+            const int a_col = kk * 8 + 2 * tid_in_grp;
+            a[kk * 4 + 0] = cacheA1[row_off + a_col][col_off + gid];
+            a[kk * 4 + 1] = cacheA1[row_off + a_col][col_off + gid + 8];
+            a[kk * 4 + 2] = cacheA1[row_off + a_col + 1][col_off + gid];
+            a[kk * 4 + 3] = cacheA1[row_off + a_col + 1][col_off + gid + 8];
+            if (apply_mask) {
+                int row_A0 = a_col, row_A1 = a_col + 1;
+                if (!(gid <= row_A0 && row_A0 < sub_seq_len && gid < sub_seq_len))
+                    a[kk * 4 + 0] = 0.0f;
+                if (!(gid + 8 <= row_A0 && row_A0 < sub_seq_len && gid + 8 < sub_seq_len))
+                    a[kk * 4 + 1] = 0.0f;
+                if (!(gid <= row_A1 && row_A1 < sub_seq_len && gid < sub_seq_len))
+                    a[kk * 4 + 2] = 0.0f;
+                if (!(gid + 8 <= row_A1 && row_A1 < sub_seq_len && gid + 8 < sub_seq_len))
+                    a[kk * 4 + 3] = 0.0f;
+            }
+            a[kk * 4 + 0] = __uint_as_float(__float_as_uint(a[kk * 4 + 0]) & TF32_MASK);
+            a[kk * 4 + 1] = __uint_as_float(__float_as_uint(a[kk * 4 + 1]) & TF32_MASK);
+            a[kk * 4 + 2] = __uint_as_float(__float_as_uint(a[kk * 4 + 2]) & TF32_MASK);
+            a[kk * 4 + 3] = __uint_as_float(__float_as_uint(a[kk * 4 + 3]) & TF32_MASK);
+        }
+#pragma unroll
+        for (int nt = 0; nt < NT; nt++) {
+            const int n_base = nt << 3;
+#pragma unroll
+            for (int kk = 0; kk < 2; kk++) {
+                const int b_k = kk * 8 + 2 * tid_in_grp;
+                uint32_t ub0 = __float_as_uint(B_x[b_k][n_base + gid]) & TF32_MASK;
+                uint32_t ub1 = __float_as_uint(B_x[b_k + 1][n_base + gid]) & TF32_MASK;
+                mma_m16n8k8_acc(
+                    acc[nt * 4],
+                    acc[nt * 4 + 1],
+                    acc[nt * 4 + 2],
+                    acc[nt * 4 + 3],
+                    __float_as_uint(a[kk * 4 + 0]),
+                    __float_as_uint(a[kk * 4 + 1]),
+                    __float_as_uint(a[kk * 4 + 2]),
+                    __float_as_uint(a[kk * 4 + 3]),
+                    ub0,
+                    ub1);
+            }
+        }
+    }
+    {
+        float a[8];
+#pragma unroll
+        for (int kk = 0; kk < 2; kk++) {
+            const int a_col = kk * 8 + 2 * tid_in_grp;
+            a[kk * 4 + 0] = cacheA2[row_off + a_col][col_off + gid];
+            a[kk * 4 + 1] = cacheA2[row_off + a_col][col_off + gid + 8];
+            a[kk * 4 + 2] = cacheA2[row_off + a_col + 1][col_off + gid];
+            a[kk * 4 + 3] = cacheA2[row_off + a_col + 1][col_off + gid + 8];
+            if (apply_mask) {
+                int row_A0 = a_col, row_A1 = a_col + 1;
+                if (!(gid <= row_A0 && row_A0 < sub_seq_len && gid < sub_seq_len))
+                    a[kk * 4 + 0] = 0.0f;
+                if (!(gid + 8 <= row_A0 && row_A0 < sub_seq_len && gid + 8 < sub_seq_len))
+                    a[kk * 4 + 1] = 0.0f;
+                if (!(gid <= row_A1 && row_A1 < sub_seq_len && gid < sub_seq_len))
+                    a[kk * 4 + 2] = 0.0f;
+                if (!(gid + 8 <= row_A1 && row_A1 < sub_seq_len && gid + 8 < sub_seq_len))
+                    a[kk * 4 + 3] = 0.0f;
+            }
+            a[kk * 4 + 0] = __uint_as_float(__float_as_uint(a[kk * 4 + 0]) & TF32_MASK);
+            a[kk * 4 + 1] = __uint_as_float(__float_as_uint(a[kk * 4 + 1]) & TF32_MASK);
+            a[kk * 4 + 2] = __uint_as_float(__float_as_uint(a[kk * 4 + 2]) & TF32_MASK);
+            a[kk * 4 + 3] = __uint_as_float(__float_as_uint(a[kk * 4 + 3]) & TF32_MASK);
+        }
+#pragma unroll
+        for (int nt = 0; nt < NT; nt++) {
+            const int n_base = nt << 3;
+#pragma unroll
+            for (int kk = 0; kk < 2; kk++) {
+                const int b_k = kk * 8 + 2 * tid_in_grp;
+                uint32_t ub0 = __float_as_uint(B_y[b_k][n_base + gid]) & TF32_MASK;
+                uint32_t ub1 = __float_as_uint(B_y[b_k + 1][n_base + gid]) & TF32_MASK;
+                mma_m16n8k8_acc(
+                    acc[nt * 4],
+                    acc[nt * 4 + 1],
+                    acc[nt * 4 + 2],
+                    acc[nt * 4 + 3],
+                    __float_as_uint(a[kk * 4 + 0]),
+                    __float_as_uint(a[kk * 4 + 1]),
+                    __float_as_uint(a[kk * 4 + 2]),
+                    __float_as_uint(a[kk * 4 + 3]),
+                    ub0,
+                    ub1);
+            }
+        }
+    }
+}
+
+__device__ __forceinline__ void
+load_block_cp_async(float dst[][BK_S], const float* src, int row_base, int stride, int tile_seq_len, int tid) {
+#pragma unroll
+    for (int pass = 0; pass < 4; pass++) {
+        int f4_r = pass * 4 + (tid >> 3);
+        int f4_c = (tid & 7) << 2;
+        int r = row_base + f4_r;
+        if (r < tile_seq_len) {
+            cp_async_16(&dst[f4_r][f4_c], &src[r * stride + f4_c]);
+        } else {
+            float4 zero = {0, 0, 0, 0};
+            *(float4*)(&dst[f4_r][f4_c]) = zero;
+        }
+    }
+}
+
 __global__ void
-__launch_bounds__(NUM_THREADS) kda_bwd_intra_kernel_sm90(__grid_constant__ const KDA_bwd_intra_params params) {
-    extern __shared__ char smem_buf[];
-    SmemStorage& smem = *reinterpret_cast<SmemStorage*>(smem_buf);
+__launch_bounds__(BLOCK_THREADS, 3) kda_bwd_intra_sm90_kernel(const KDA_bwd_intra_params params) {
+    extern __shared__ char shared_buf[];
+    SmemLayout* smem = reinterpret_cast<SmemLayout*>(shared_buf);
 
-    // ── Extract typed pointers (active code path only) ──
-    const auto* beta_ptr = reinterpret_cast<const __nv_bfloat16*>(params.beta_ptr);
-    auto* dq_out_ptr = reinterpret_cast<__nv_bfloat16*>(params.dq_out_ptr);
-    auto* dk_out_ptr = reinterpret_cast<__nv_bfloat16*>(params.dk_out_ptr);
-    auto* db_out_ptr = reinterpret_cast<float*>(params.db_out_ptr);
-    auto* dg_out_ptr = reinterpret_cast<float*>(params.dg_out_ptr);
-    const auto* k_ptr = reinterpret_cast<const __nv_bfloat16*>(params.k_ptr);
-    const auto* g_ptr = reinterpret_cast<const float*>(params.g_ptr);
-    const auto* q_ptr = reinterpret_cast<const __nv_bfloat16*>(params.q_ptr);
-    const auto* dq_ptr = reinterpret_cast<const float*>(params.dq_ptr);
-    const auto* dk_ptr = reinterpret_cast<const float*>(params.dk_ptr);
-    const auto* dg_ptr = reinterpret_cast<const float*>(params.dg_ptr);
-    const auto* dAqk_ptr = reinterpret_cast<const float*>(params.dAqk_ptr);
-    const auto* dAkk_ptr = reinterpret_cast<const float*>(params.dAkk_ptr);
-    const auto* cu_seqlens = reinterpret_cast<const int*>(params.cu_seqlens_ptr);
-    const auto* chunk_idx = reinterpret_cast<const int*>(params.chunk_indices_ptr);
+    const int warp_id = threadIdx.x / WARP_SIZE;
+    const int tid = threadIdx.x % WARP_SIZE;
+    const int i_i = warp_id;
+
+    const int gid = tid >> 2;
+    const int tid_in_grp = tid & 3;
+
+    const int* chunk_indices = (const int*)params.chunk_indices_ptr;
+    const int* cu_seqlens = (const int*)params.cu_seqlens_ptr;
+    int* tile_counter = (int*)params.tile_counter_ptr;
 
     const int H = params.h;
     const int K = params.d;
-    const int total_q_len = params.total_q_len;
+    const int stride_qk = H * K;
+    const int stride_dA = H * BT;
+    const int stride_b = H;
+    const int total_tiles = params.num_chunks * H;
 
-    const int tid = threadIdx.x;
-    const int warp_idx = tid / 32;
+    const __nv_bfloat16(*my_q)[BK] = &smem->q_s[i_i * BC];
+    const __nv_bfloat16(*my_k)[BK] = &smem->k_s[i_i * BC];
+    const float(*my_g)[BK_S] = (const float(*)[BK_S]) & smem->g_s[i_i * BC];
+    WarpWork& ww = smem->ww[i_i];
+    const int row0 = gid;
+    const int row1 = gid + 8;
 
-    // Decode block coordinates via tile scheduler
-    NaiveTileScheduler scheduler(params.tile_scheduler_params);
-    auto coord = scheduler.get_block_coord(chunk_idx, cu_seqlens);
-    const int i_h = get<1>(coord);
-    const int i_t = get<2>(coord);
-    const int i_k = get<3>(coord);
-    const int i_i = get<4>(coord);
-    const int bos = get<5>(coord);
-    const int T_seq = get<6>(coord);
-
-    const int i_ti = i_t * BT + i_i * BC;
-    if (i_ti >= T_seq)
-        return;
-
-    const int tile_row = i_t * NC + i_i;
-
-    // ── CuTe gmem tensors ──
-    auto make_seq_hd = [&](auto ptr, int D) {
-        auto g_full = make_tensor(make_gmem_ptr(ptr), make_shape(total_q_len, H, D), make_stride(H * D, D, _1{}));
-        auto g_head = g_full(_, i_h, _);
-        return make_tensor(g_head.data() + g_head.layout()(bos, 0), make_shape(T_seq, D), stride(g_head));
-    };
-
-    auto mDqOut = make_seq_hd(dq_out_ptr, K);
-    auto mDkOut = make_seq_hd(dk_out_ptr, K);
-    auto mDgOut = make_seq_hd(dg_out_ptr, K);
-    auto mBeta = make_tensor(make_gmem_ptr(beta_ptr + bos * H + i_h), make_shape(T_seq), make_stride(H));
-    auto mDBout = make_tensor(
-        make_gmem_ptr(db_out_ptr + i_k * total_q_len * H + bos * H + i_h), make_shape(T_seq), make_stride(H));
-
-    auto mQ = make_seq_hd(q_ptr, K);
-    auto mK = make_seq_hd(k_ptr, K);
-    auto mG = make_seq_hd(g_ptr, K);
-    auto mDq = make_seq_hd(dq_ptr, K);
-    auto mDk = make_seq_hd(dk_ptr, K);
-    auto mDg = make_seq_hd(dg_ptr, K);
-    auto mDAqk_g = make_seq_hd(dAqk_ptr, BT);  // [T_seq, BT] for cp.async Phase 1
-    auto mDAkk_g = make_seq_hd(dAkk_ptr, BT);
-
-    auto tile_hk = make_shape(Int<BC>{}, Int<BK>{});
-    auto tile_da = make_shape(Int<BC>{}, Int<BC>{});  // [16,16] for dA tiles
-
-    // ── SMEM tensor views ──
-    auto sQ = make_tensor(make_smem_ptr(smem.s_q.data()), SmemLayoutQK{});
-    auto sK = make_tensor(make_smem_ptr(smem.s_k.data()), SmemLayoutQK{});
-    auto sG = make_tensor(make_smem_ptr(smem.s_g.data()), SmemLayoutG{});
-    auto sKG = make_tensor(make_smem_ptr(smem.s_KG.data()), SmemLayoutB_op{});  // Phase1: KG, Phase2: QG
-    auto sQG = sKG;  // alias — same physical smem, different semantic name
-    auto sKBG = make_tensor(make_smem_ptr(smem.s_KBG.data()), SmemLayoutB_op{});
-    auto sDAqk = make_tensor(make_smem_ptr(smem.s_dA_qk.data()), SmemLayoutDA{});
-    auto sDAkk = make_tensor(make_smem_ptr(smem.s_dA_kk.data()), SmemLayoutDA{});
-
-    // Whether this tile touches the sequence boundary (last few rows may be OOB)
-    const bool is_boundary = (i_ti + BC) > T_seq;
-
-    // ── Load persistent tiles via cp.async: Q, K, G + cooperative beta ──
-    {
-        auto gQ_tile = local_tile(mQ, tile_hk, make_coord(tile_row, i_k));
-        auto gK_tile = local_tile(mK, tile_hk, make_coord(tile_row, i_k));
-        auto gG_tile = local_tile(mG, tile_hk, make_coord(tile_row, i_k));
-        auto gBeta_tile = local_tile(mBeta, Int<BC>{}, tile_row);
-
-        if (is_boundary) {
-            // Slow path: boundary tile — use src_size=0 to zero-fill OOB rows
-            constexpr int BF16_CHUNKS = (BC * BK) / 8;
-            for (int ci = tid; ci < BF16_CHUNKS; ci += NUM_THREADS) {
-                int elem = ci * 8;
-                int r = elem / BK, c = elem % BK;
-                int src_size = (i_ti + r >= T_seq) ? 0 : 16;
-                uint32_t dstQ = cute::cast_smem_ptr_to_uint(&sQ(r, c));
-                uint32_t dstK = cute::cast_smem_ptr_to_uint(&sK(r, c));
-                asm volatile(
-                    "cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dstQ), "l"(&gQ_tile(r, c)), "r"(src_size));
-                asm volatile(
-                    "cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dstK), "l"(&gK_tile(r, c)), "r"(src_size));
-            }
-            constexpr int FP32_CHUNKS = (BC * BK) / 4;
-            for (int ci = tid; ci < FP32_CHUNKS; ci += NUM_THREADS) {
-                int elem = ci * 4;
-                int r = elem / BK, c = elem % BK;
-                int src_size = (i_ti + r >= T_seq) ? 0 : 16;
-                uint32_t dstG = cute::cast_smem_ptr_to_uint(&sG(r, c));
-                asm volatile(
-                    "cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dstG), "l"(&gG_tile(r, c)), "r"(src_size));
-            }
-            if (tid < BC) {
-                smem.s_beta[tid] = (i_ti + tid < T_seq) ? __bfloat162float(gBeta_tile(tid)) : 0.f;
-            }
-        } else {
-            // Fast path: no boundary — unconditional 3-operand cp.async
-            constexpr int BF16_CHUNKS = (BC * BK) / 8;
-            for (int ci = tid; ci < BF16_CHUNKS; ci += NUM_THREADS) {
-                int elem = ci * 8;
-                int r = elem / BK, c = elem % BK;
-                uint32_t dstQ = cute::cast_smem_ptr_to_uint(&sQ(r, c));
-                uint32_t dstK = cute::cast_smem_ptr_to_uint(&sK(r, c));
-                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dstQ), "l"(&gQ_tile(r, c)));
-                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dstK), "l"(&gK_tile(r, c)));
-            }
-            constexpr int FP32_CHUNKS = (BC * BK) / 4;
-            for (int ci = tid; ci < FP32_CHUNKS; ci += NUM_THREADS) {
-                int elem = ci * 4;
-                int r = elem / BK, c = elem % BK;
-                uint32_t dstG = cute::cast_smem_ptr_to_uint(&sG(r, c));
-                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dstG), "l"(&gG_tile(r, c)));
-            }
-            if (tid < BC) {
-                smem.s_beta[tid] = __bfloat162float(gBeta_tile(tid));
-            }
-        }
-        asm volatile("cp.async.commit_group;\n");
-        asm volatile("cp.async.wait_group 0;\n");
-        __syncthreads();
-    }
-
-    // Per-thread accumulators (4 values per thread, covering 16×32 output tile)
-    float dq2_acc[4] = {0.f, 0.f, 0.f, 0.f};
-    float dk2_acc[4] = {0.f, 0.f, 0.f, 0.f};
-
-    // ════════════════════════════════════════════════════════════════════════
-    // PHASE 1 Off-diagonal (j < i_i): dQ += dAqk × KG, dK += dAkk × KG
-    // ════════════════════════════════════════════════════════════════════════
-    if (i_i > 0) {
-        if (tid < BK) {
-            smem.s_gn[tid] = sG(0, tid);
+    while (true) {
+        // ==================== PERSISTENT TILE DISPATCH ====================
+        if (threadIdx.x == 0) {
+            smem->s_tile_id = atomicAdd(tile_counter, 1);
         }
         __syncthreads();
+        const int tile_id = smem->s_tile_id;
+        if (tile_id >= total_tiles)
+            return;
 
+        const int i_t = tile_id / H;
+        const int i_h = tile_id % H;
+
+        const int batch_idx = chunk_indices[i_t * 2];
+        const int seq_idx = chunk_indices[i_t * 2 + 1];
+        const int start_offset = cu_seqlens[batch_idx];
+        const int seq_len = cu_seqlens[batch_idx + 1] - start_offset;
+
+        const int tile_seq_len = min(BT, seq_len - seq_idx * BT);
+
+        const int tile_offset = start_offset + seq_idx * BT;
+
+        const float* beta_base = (const float*)params.beta_ptr + tile_offset * stride_b + i_h;
+        const float* dAqk_base = (const float*)params.dAqk_ptr + tile_offset * stride_dA + i_h * BT;
+        const float* dAkk_base = (const float*)params.dAkk_ptr + tile_offset * stride_dA + i_h * BT;
+
+        const int sub_seq_len = min(BC, tile_seq_len - i_i * BC);
+        const bool warp_active = (sub_seq_len > 0);
+        const int NC_actual = min(NC, (tile_seq_len + BC - 1) / BC);
+
+        // Load beta (k-independent)
+        if (threadIdx.x < BT) {
+            smem->beta_s[threadIdx.x] = (threadIdx.x < tile_seq_len) ? beta_base[threadIdx.x * stride_b] : 0.0f;
+        }
+
+// ==================== dA CACHE LOAD ====================
 #pragma unroll 1
-        for (int i_j = 0; i_j < i_i; ++i_j) {
-            int j_tile = i_t * NC + i_j;
-
-            // cp.async load dAqk + dAkk: fp32 [16,16] = 256 elems, 4 per chunk → 64 chunks
-            {
-                auto gDAqk_j = local_tile(mDAqk_g, tile_da, make_coord(tile_row, i_j));
-                auto gDAkk_j = local_tile(mDAkk_g, tile_da, make_coord(tile_row, i_j));
-                constexpr int DA_CHUNKS = (BC * BC) / 4;  // 64
-                if (is_boundary) {
-                    for (int ci = tid; ci < DA_CHUNKS; ci += NUM_THREADS) {
-                        int elem = ci * 4;
-                        int r = elem / BC, c = elem % BC;
-                        uint32_t dst_qk = cute::cast_smem_ptr_to_uint(&sDAqk(r, c));
-                        uint32_t dst_kk = cute::cast_smem_ptr_to_uint(&sDAkk(r, c));
-                        int src_size = (i_ti + r >= T_seq) ? 0 : 16;
-                        asm volatile(
-                            "cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dst_qk),
-                            "l"(&gDAqk_j(r, c)),
-                            "r"(src_size));
-                        asm volatile(
-                            "cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dst_kk),
-                            "l"(&gDAkk_j(r, c)),
-                            "r"(src_size));
-                    }
-                } else {
-                    for (int ci = tid; ci < DA_CHUNKS; ci += NUM_THREADS) {
-                        int elem = ci * 4;
-                        int r = elem / BC, c = elem % BC;
-                        uint32_t dst_qk = cute::cast_smem_ptr_to_uint(&sDAqk(r, c));
-                        uint32_t dst_kk = cute::cast_smem_ptr_to_uint(&sDAkk(r, c));
-                        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst_qk), "l"(&gDAqk_j(r, c)));
-                        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst_kk), "l"(&gDAkk_j(r, c)));
-                    }
-                }
-            }
-
-            // Build KG operand from gmem (mirrors sm100 setup_kg_intra)
-            {
-                auto gK_j = local_tile(mK, tile_hk, make_coord(j_tile, i_k));
-                auto gG_j = local_tile(mG, tile_hk, make_coord(j_tile, i_k));
-                sm90_bwd_intra::setup_kg_intra_offdiag_gmem<BC, BK, NUM_THREADS>(
-                    sKG, gK_j, gG_j, smem.s_gn.data(), tid);
-            }
-
-            // Wait for cp.async dA + fence KG writes
-            asm volatile("cp.async.commit_group;\n");
-            asm volatile("cp.async.wait_group 0;\n");
-            __syncthreads();
-
-            gemm_m16n32k16_shared_b(smem.s_dA_qk.data(), smem.s_dA_kk.data(), smem.s_KG.data(), dq2_acc, dk2_acc, tid);
-            __syncthreads();
-        }
-
-        // Post-multiply: *= exp2(g_i - gn)
-        for (int v = 0; v < 4; ++v) {
-            int row, col;
-            get_acc_row_col(tid, v, row, col);
-            float scale = exp2f(sG(row, col) - smem.s_gn[col]);
-            dq2_acc[v] *= scale;
-            dk2_acc[v] *= scale;
-        }
-    }
-
-    // ════════════════════════════════════════════════════════════════════════
-    // PHASE 1 Diagonal (j == i_i, lower-triangular): dQ, dK
-    // ════════════════════════════════════════════════════════════════════════
-    __syncthreads();
-    {
-        int mid = min(BC / 2, T_seq - i_ti - 1);
-        if (tid < BK) {
-            smem.s_gn[tid] = sG(mid, tid);
-        }
-        __syncthreads();
-
-        // cp.async load dAqk + dAkk diagonal tile
-        {
-            auto gDAqk_diag = local_tile(mDAqk_g, tile_da, make_coord(tile_row, i_i));
-            auto gDAkk_diag = local_tile(mDAkk_g, tile_da, make_coord(tile_row, i_i));
-            constexpr int DA_CHUNKS = (BC * BC) / 4;  // 64
-            if (is_boundary) {
-                for (int ci = tid; ci < DA_CHUNKS; ci += NUM_THREADS) {
-                    int elem = ci * 4;
-                    int r = elem / BC, c = elem % BC;
-                    uint32_t dst_qk = cute::cast_smem_ptr_to_uint(&sDAqk(r, c));
-                    uint32_t dst_kk = cute::cast_smem_ptr_to_uint(&sDAkk(r, c));
-                    int src_size = (i_ti + r >= T_seq) ? 0 : 16;
-                    asm volatile(
-                        "cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dst_qk),
-                        "l"(&gDAqk_diag(r, c)),
-                        "r"(src_size));
-                    asm volatile(
-                        "cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dst_kk),
-                        "l"(&gDAkk_diag(r, c)),
-                        "r"(src_size));
-                }
+        for (int elem4 = threadIdx.x; elem4 < BT * (BT >> 2); elem4 += BLOCK_THREADS) {
+            int r = elem4 >> 4;
+            int c = (elem4 & 15) << 2;
+            if (r < tile_seq_len) {
+                cp_async_16(&smem->dAqk_cache[r][c], &dAqk_base[r * stride_dA + c]);
+                cp_async_16(&smem->dAkk_cache[r][c], &dAkk_base[r * stride_dA + c]);
             } else {
-                for (int ci = tid; ci < DA_CHUNKS; ci += NUM_THREADS) {
-                    int elem = ci * 4;
-                    int r = elem / BC, c = elem % BC;
-                    uint32_t dst_qk = cute::cast_smem_ptr_to_uint(&sDAqk(r, c));
-                    uint32_t dst_kk = cute::cast_smem_ptr_to_uint(&sDAkk(r, c));
-                    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst_qk), "l"(&gDAqk_diag(r, c)));
-                    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst_kk), "l"(&gDAkk_diag(r, c)));
+                float4 zero = {0, 0, 0, 0};
+                *reinterpret_cast<float4*>(&smem->dAqk_cache[r][c]) = zero;
+                *reinterpret_cast<float4*>(&smem->dAkk_cache[r][c]) = zero;
+            }
+        }
+        cp_async_commit();
+        cp_async_wait_all();
+        __syncthreads();
+
+        // ==================== K-SLICE LOOP ====================
+        for (int i_k = 0; i_k < NK; i_k++) {
+            const int k_off = i_k * BK;
+
+            // Load Q, K, G for this K-iteration
+            {
+                const __nv_bfloat16* q_base =
+                    (const __nv_bfloat16*)params.q_ptr + tile_offset * stride_qk + i_h * K + k_off;
+                const __nv_bfloat16* k_base =
+                    (const __nv_bfloat16*)params.k_ptr + tile_offset * stride_qk + i_h * K + k_off;
+                const float* g_base = (const float*)params.g_ptr + tile_offset * stride_qk + i_h * K + k_off;
+                for (int elem = threadIdx.x; elem < BT * (BK / 8); elem += BLOCK_THREADS) {
+                    int r = elem >> 2;
+                    int c = (elem & 3) << 3;
+                    if (r < tile_seq_len) {
+                        int goff = r * stride_qk + c;
+                        cp_async_16(&smem->q_s[r][c], &q_base[goff]);
+                        cp_async_16(&smem->k_s[r][c], &k_base[goff]);
+                    } else {
+                        uint4 zero4 = {0, 0, 0, 0};
+                        *reinterpret_cast<uint4*>(&smem->q_s[r][c]) = zero4;
+                        *reinterpret_cast<uint4*>(&smem->k_s[r][c]) = zero4;
+                    }
+                }
+                for (int elem = threadIdx.x; elem < BT * (BK / 4); elem += BLOCK_THREADS) {
+                    int r = elem >> 3;
+                    int c = (elem & 7) << 2;
+                    if (r < tile_seq_len) {
+                        cp_async_16(&smem->g_s[r][c], &g_base[r * stride_qk + c]);
+                    } else {
+                        float4 zero = {0, 0, 0, 0};
+                        *reinterpret_cast<float4*>(&smem->g_s[r][c]) = zero;
+                    }
                 }
             }
-        }
+            cp_async_commit();
+            cp_async_wait_all();
+            __syncthreads();
 
-        // Build KG from persistent smem K, G (overlaps cp.async)
-        sm90_bwd_intra::setup_kg_intra_diag<BC, BK, NUM_THREADS>(sKG, sK, sG, smem.s_gn.data(), T_seq, i_ti, tid);
+            const float* dq_base = (const float*)params.dq_ptr + tile_offset * stride_qk + i_h * K + k_off;
+            const float* dk_base = (const float*)params.dk_ptr + tile_offset * stride_qk + i_h * K + k_off;
+            const float* dg_base = (const float*)params.dg_ptr + tile_offset * stride_qk + i_h * K + k_off;
+            __nv_bfloat16* dq_out = (__nv_bfloat16*)params.dq_out_ptr + tile_offset * stride_qk + i_h * K + k_off;
+            __nv_bfloat16* dk_out = (__nv_bfloat16*)params.dk_out_ptr + tile_offset * stride_qk + i_h * K + k_off;
+            float* db2_base = (float*)params.db2_ptr + i_k * params.total_q_len * H + tile_offset * stride_b + i_h;
+            float* dg_out = (float*)params.dg_out_ptr + tile_offset * stride_qk + i_h * K + k_off;
 
-        // Wait for cp.async dA + fence KG writes
-        asm volatile("cp.async.commit_group;\n");
-        asm volatile("cp.async.wait_group 0;\n");
-        __syncthreads();
+            if (warp_active) {
+                // ==================== FORWARD OFF-DIAGONAL ====================
+                float dq2[16] = {0};
+                float dk2[16] = {0};
 
-        // Apply lower-triangular mask to both dAqk and dAkk
-        for (int idx = tid; idx < BC * BC; idx += NUM_THREADS) {
-            int r = idx / BC, c = idx % BC;
-            bool valid = (r >= c) && (i_ti + r < T_seq) && (i_ti + c < T_seq);
-            if (!valid) {
-                sDAqk(r, c) = 0.f;
-                sDAkk(r, c) = 0.f;
-            }
-        }
-        __syncthreads();
-
-        float tmp_dq[4] = {0.f, 0.f, 0.f, 0.f};
-        float tmp_dk[4] = {0.f, 0.f, 0.f, 0.f};
-        gemm_m16n32k16_shared_b(smem.s_dA_qk.data(), smem.s_dA_kk.data(), smem.s_KG.data(), tmp_dq, tmp_dk, tid);
-
-        for (int v = 0; v < 4; ++v) {
-            int row, col;
-            get_acc_row_col(tid, v, row, col);
-            bool valid = (i_ti + row) < T_seq;
-            float g_diff = valid ? (sG(row, col) - smem.s_gn[col]) : 0.f;
-            float scale = valid ? exp2f(g_diff) : 0.f;
-            dq2_acc[v] += tmp_dq[v] * scale;
-            dk2_acc[v] += tmp_dk[v] * scale;
-        }
-    }
-
-    // ════════════════════════════════════════════════════════════════════════
-    // INTERMEDIATE: db = reduce(dk2 * k), dk2 *= beta
-    // ════════════════════════════════════════════════════════════════════════
-    __syncthreads();
-    {
-        auto sAcc = make_tensor(make_smem_ptr(smem.s_acc.data()), SmemLayoutAcc{});
-        // Write dk2 * k into smem for row-reduction
-        for (int v = 0; v < 4; ++v) {
-            int row, col;
-            get_acc_row_col(tid, v, row, col);
-            float kv = __bfloat162float(sK(row, col));
-            sAcc(row, col) = dk2_acc[v] * kv;
-        }
-        __syncthreads();
-
-        // Row reduction: 128 threads → 16 rows, 8 threads/row, 4 cols each
-        {
-            int red_row = tid / 8;
-            int red_lane = tid % 8;
-            float sum = 0.f;
+                if (i_i > 0) {
+#pragma unroll 1
+                    for (int j = 0; j < i_i; j++) {
 #pragma unroll
-            for (int c = red_lane * 4; c < red_lane * 4 + 4; ++c) {
-                sum += sAcc(red_row, c);
-            }
-            sum += __shfl_xor_sync(0xffffffff, sum, 1);
-            sum += __shfl_xor_sync(0xffffffff, sum, 2);
-            sum += __shfl_xor_sync(0xffffffff, sum, 4);
-            if (red_lane == 0) {
-                smem.s_db[red_row] = sum;
-            }
-        }
+                        for (int pass = 0; pass < 4; pass++) {
+                            int f4_r = pass * 4 + (tid >> 3);
+                            int f4_c = (tid & 7) << 2;
+                            float4 ks = load_bf16x4(&smem->k_s[j * BC + f4_r][f4_c]);
+                            float4 gs_j = *reinterpret_cast<const float4*>(&smem->g_s[j * BC + f4_r][f4_c]);
+                            float4 gs_gn = *reinterpret_cast<const float4*>(&my_g[0][f4_c]);
+                            float4 ba;
+                            ba.x = ks.x * exp2f(gs_gn.x - gs_j.x);
+                            ba.y = ks.y * exp2f(gs_gn.y - gs_j.y);
+                            ba.z = ks.z * exp2f(gs_gn.z - gs_j.z);
+                            ba.w = ks.w * exp2f(gs_gn.w - gs_j.w);
+                            *reinterpret_cast<float4*>(&ww.B_a[f4_r][f4_c]) = ba;
+                        }
+                        __syncwarp();
+                        matmul_1warp_2A_from_cache(
+                            dq2,
+                            dk2,
+                            smem->dAqk_cache,
+                            smem->dAkk_cache,
+                            i_i * BC,
+                            j * BC,
+                            ww.B_a,
+                            gid,
+                            tid_in_grp,
+                            false,
+                            BC);
+                    }
+#pragma unroll
+                    for (int nt = 0; nt < NT; nt++) {
+                        int col0 = nt * 8 + tid_in_grp * 2;
+                        int col1 = col0 + 1;
+                        float gn0 = my_g[0][col0], gn1 = my_g[0][col1];
+                        float s00 = exp2f(my_g[row0][col0] - gn0);
+                        float s01 = exp2f(my_g[row0][col1] - gn1);
+                        float s10 = exp2f(my_g[row1][col0] - gn0);
+                        float s11 = exp2f(my_g[row1][col1] - gn1);
+                        dq2[nt * 4 + 0] *= s00;
+                        dq2[nt * 4 + 1] *= s01;
+                        dq2[nt * 4 + 2] *= s10;
+                        dq2[nt * 4 + 3] *= s11;
+                        dk2[nt * 4 + 0] *= s00;
+                        dk2[nt * 4 + 1] *= s01;
+                        dk2[nt * 4 + 2] *= s10;
+                        dk2[nt * 4 + 3] *= s11;
+                    }
+                }
 
-        // dk2 *= beta
-        for (int v = 0; v < 4; ++v) {
-            int row, col;
-            get_acc_row_col(tid, v, row, col);
-            dk2_acc[v] *= smem.s_beta[row];
-        }
-        __syncthreads();
-    }
+                // ==================== FORWARD DIAGONAL ====================
+                {
+                    int gn_row = min(BC / 2, sub_seq_len - 1);
 
-    // ════════════════════════════════════════════════════════════════════════
-    // PHASE 1 EPILOGUE: store dQ output, db output (coalesced via smem staging)
-    // ════════════════════════════════════════════════════════════════════════
-    {
-        auto gDq_tile = local_tile(mDq, tile_hk, make_coord(tile_row, i_k));
-        auto gDqOut_tile = local_tile(mDqOut, tile_hk, make_coord(tile_row, i_k));
-        auto sStage = make_tensor(make_smem_ptr(smem.s_acc.data()), SmemLayoutAcc{});
+#pragma unroll
+                    for (int pass = 0; pass < 4; pass++) {
+                        int f4_r = pass * 4 + (tid >> 3);
+                        int f4_c = (tid & 7) << 2;
+                        if (f4_r < sub_seq_len) {
+                            float4 ks = load_bf16x4(&my_k[f4_r][f4_c]);
+                            float4 gs_gn = *reinterpret_cast<const float4*>(&my_g[gn_row][f4_c]);
+                            float4 gs_r = *reinterpret_cast<const float4*>(&my_g[f4_r][f4_c]);
+                            float4 ba;
+                            ba.x = ks.x * exp2f(gs_gn.x - gs_r.x);
+                            ba.y = ks.y * exp2f(gs_gn.y - gs_r.y);
+                            ba.z = ks.z * exp2f(gs_gn.z - gs_r.z);
+                            ba.w = ks.w * exp2f(gs_gn.w - gs_r.w);
+                            *reinterpret_cast<float4*>(&ww.B_a[f4_r][f4_c]) = ba;
+                        } else {
+                            float4 zero = {0, 0, 0, 0};
+                            *reinterpret_cast<float4*>(&ww.B_a[f4_r][f4_c]) = zero;
+                        }
+                    }
+                    __syncwarp();
 
-        sm90_bwd_intra::epilogue_output_dq<BC, BK, NUM_THREADS>(
-            gDq_tile, gDqOut_tile, sStage, dq2_acc, T_seq, i_ti, tid);
+                    float dqd[16] = {0};
+                    float dkd[16] = {0};
+                    matmul_1warp_2A_from_cache(
+                        dqd,
+                        dkd,
+                        smem->dAqk_cache,
+                        smem->dAkk_cache,
+                        i_i * BC,
+                        i_i * BC,
+                        ww.B_a,
+                        gid,
+                        tid_in_grp,
+                        true,
+                        sub_seq_len);
 
-        if (tid < BC && (i_ti + tid) < T_seq) {
-            mDBout(i_ti + tid) = smem.s_db[tid];
-        }
-    }
+                    // Start dq_in load into B_a (MMA is done reading B_a)
+                    load_block_cp_async(ww.B_a, dq_base, i_i * BC, stride_qk, tile_seq_len, tid);
+                    cp_async_commit();
 
-    // ════════════════════════════════════════════════════════════════════════
-    // PHASE 2: dKT computation (transposed dA contributions)
-    // ════════════════════════════════════════════════════════════════════════
-    float dkt_acc[4] = {0.f, 0.f, 0.f, 0.f};
-    __syncthreads();
+#pragma unroll
+                    for (int nt = 0; nt < NT; nt++) {
+                        int col0 = nt * 8 + tid_in_grp * 2;
+                        int col1 = col0 + 1;
+                        float gn0 = my_g[gn_row][col0], gn1 = my_g[gn_row][col1];
+                        float s00 = exp2f(my_g[row0][col0] - gn0);
+                        float s01 = exp2f(my_g[row0][col1] - gn1);
+                        float s10 = exp2f(my_g[row1][col0] - gn0);
+                        float s11 = exp2f(my_g[row1][col1] - gn1);
+                        dq2[nt * 4 + 0] += dqd[nt * 4 + 0] * s00;
+                        dq2[nt * 4 + 1] += dqd[nt * 4 + 1] * s01;
+                        dq2[nt * 4 + 2] += dqd[nt * 4 + 2] * s10;
+                        dq2[nt * 4 + 3] += dqd[nt * 4 + 3] * s11;
+                        dk2[nt * 4 + 0] += dkd[nt * 4 + 0] * s00;
+                        dk2[nt * 4 + 1] += dkd[nt * 4 + 1] * s01;
+                        dk2[nt * 4 + 2] += dkd[nt * 4 + 2] * s10;
+                        dk2[nt * 4 + 3] += dkd[nt * 4 + 3] * s11;
+                    }
+                }
 
-    int NC_eff = min(NC, (T_seq - i_t * BT + BC - 1) / BC);
+                // Wait for dq_in load
+                cp_async_wait_all();
+                __syncwarp();
 
-    // ── Phase 2 off-diagonal (j > i_i) ──
-    if (i_i < NC_eff - 1) {
-        int last_local = min(BC, T_seq - i_ti) - 1;
-        if (tid < BK) {
-            smem.s_gn[tid] = sG(last_local, tid);
-        }
-        __syncthreads();
+                // Write dq_out = dq2 + dq_in, then reuse dq2 for dg_p = q * dq2
+                {
+                    int tile_r0 = i_i * BC + row0;
+                    int tile_r1 = i_i * BC + row1;
+#pragma unroll
+                    for (int nt = 0; nt < NT; nt++) {
+                        int col0 = nt * 8 + tid_in_grp * 2;
+                        if (row0 < sub_seq_len) {
+                            __nv_bfloat162 pair = {
+                                __float2bfloat16(dq2[nt * 4 + 0] + ww.B_a[row0][col0]),
+                                __float2bfloat16(dq2[nt * 4 + 1] + ww.B_a[row0][col0 + 1])};
+                            st_global_cg_u32(&dq_out[tile_r0 * stride_qk + col0], *reinterpret_cast<uint32_t*>(&pair));
+                        }
+                        if (row1 < sub_seq_len) {
+                            __nv_bfloat162 pair = {
+                                __float2bfloat16(dq2[nt * 4 + 2] + ww.B_a[row1][col0]),
+                                __float2bfloat16(dq2[nt * 4 + 3] + ww.B_a[row1][col0 + 1])};
+                            st_global_cg_u32(&dq_out[tile_r1 * stride_qk + col0], *reinterpret_cast<uint32_t*>(&pair));
+                        }
+                        dq2[nt * 4 + 0] = bf2f(my_q[row0][col0]) * dq2[nt * 4 + 0];
+                        dq2[nt * 4 + 1] = bf2f(my_q[row0][col0 + 1]) * dq2[nt * 4 + 1];
+                        dq2[nt * 4 + 2] = bf2f(my_q[row1][col0]) * dq2[nt * 4 + 2];
+                        dq2[nt * 4 + 3] = bf2f(my_q[row1][col0 + 1]) * dq2[nt * 4 + 3];
+                    }
+                }
+
+                // db reduction
+                {
+                    float db0 = 0, db1 = 0;
+#pragma unroll
+                    for (int nt = 0; nt < NT; nt++) {
+                        int col0 = nt * 8 + tid_in_grp * 2;
+                        int col1 = col0 + 1;
+                        db0 += dk2[nt * 4 + 0] * bf2f(my_k[row0][col0]) + dk2[nt * 4 + 1] * bf2f(my_k[row0][col1]);
+                        db1 += dk2[nt * 4 + 2] * bf2f(my_k[row1][col0]) + dk2[nt * 4 + 3] * bf2f(my_k[row1][col1]);
+                    }
+                    db0 += __shfl_xor_sync(0xFFFFFFFF, db0, 1);
+                    db0 += __shfl_xor_sync(0xFFFFFFFF, db0, 2);
+                    db1 += __shfl_xor_sync(0xFFFFFFFF, db1, 1);
+                    db1 += __shfl_xor_sync(0xFFFFFFFF, db1, 2);
+                    if (tid_in_grp == 0) {
+                        if (row0 < sub_seq_len)
+                            st_global_cg_f32(&db2_base[(i_i * BC + row0) * stride_b], db0);
+                        if (row1 < sub_seq_len)
+                            st_global_cg_f32(&db2_base[(i_i * BC + row1) * stride_b], db1);
+                    }
+                }
+
+                // Scale dk2 by beta
+                {
+                    float beta0 = smem->beta_s[i_i * BC + row0];
+                    float beta1 = smem->beta_s[i_i * BC + row1];
+#pragma unroll
+                    for (int nt = 0; nt < NT; nt++) {
+                        dk2[nt * 4 + 0] *= beta0;
+                        dk2[nt * 4 + 1] *= beta0;
+                        dk2[nt * 4 + 2] *= beta1;
+                        dk2[nt * 4 + 3] *= beta1;
+                    }
+                }
+
+                // ==================== BACKWARD OFF-DIAGONAL ====================
+                float dkt[16] = {0};
+
+                if (i_i < NC_actual - 1) {
+                    int gn_bwd_row = min(BC - 1, sub_seq_len - 1);
 
 #pragma unroll 1
-        for (int i_j = i_i + 1; i_j < NC_eff; ++i_j) {
-            int j_tile = i_t * NC + i_j;
-            int j_ti = i_t * BT + i_j * BC;
+                    for (int j = i_i + 1; j < NC_actual; j++) {
+                        int j_sub_seq = min(BC, tile_seq_len - j * BC);
+#pragma unroll
+                        for (int pass = 0; pass < 4; pass++) {
+                            int f4_r = pass * 4 + (tid >> 3);
+                            int f4_c = (tid & 7) << 2;
+                            if (f4_r < j_sub_seq) {
+                                float4 qs = load_bf16x4(&smem->q_s[j * BC + f4_r][f4_c]);
+                                float4 ks = load_bf16x4(&smem->k_s[j * BC + f4_r][f4_c]);
+                                float4 gs_j = *reinterpret_cast<const float4*>(&smem->g_s[j * BC + f4_r][f4_c]);
+                                float4 gs_gn = *reinterpret_cast<const float4*>(&my_g[gn_bwd_row][f4_c]);
+                                float beta_val = smem->beta_s[j * BC + f4_r];
 
-            // Coalesced transposed loads: read dA row-major as float4, transpose on smem write
-            constexpr int DA_VEC_ELEMS = BC * BC / 4;  // 64
-            for (int vi = tid; vi < DA_VEC_ELEMS; vi += NUM_THREADS) {
-                int r = vi / (BC / 4);
-                int c = (vi % (BC / 4)) * 4;
-                bool valid = (j_ti + r) < T_seq;
-                int gmem_addr = (bos + j_ti + r) * (H * BT) + i_h * BT + i_i * BC + c;
-                if (valid) {
-                    float4 qv = *reinterpret_cast<const float4*>(dAqk_ptr + gmem_addr);
-                    float4 kv = *reinterpret_cast<const float4*>(dAkk_ptr + gmem_addr);
-                    sDAqk(c + 0, r) = qv.x;
-                    sDAqk(c + 1, r) = qv.y;
-                    sDAqk(c + 2, r) = qv.z;
-                    sDAqk(c + 3, r) = qv.w;
-                    sDAkk(c + 0, r) = kv.x;
-                    sDAkk(c + 1, r) = kv.y;
-                    sDAkk(c + 2, r) = kv.z;
-                    sDAkk(c + 3, r) = kv.w;
-                } else {
-                    sDAqk(c + 0, r) = 0.f;
-                    sDAqk(c + 1, r) = 0.f;
-                    sDAqk(c + 2, r) = 0.f;
-                    sDAqk(c + 3, r) = 0.f;
-                    sDAkk(c + 0, r) = 0.f;
-                    sDAkk(c + 1, r) = 0.f;
-                    sDAkk(c + 2, r) = 0.f;
-                    sDAkk(c + 3, r) = 0.f;
+                                float eg0 = exp2f(gs_j.x - gs_gn.x), eg1 = exp2f(gs_j.y - gs_gn.y),
+                                      eg2 = exp2f(gs_j.z - gs_gn.z), eg3 = exp2f(gs_j.w - gs_gn.w);
+
+                                float4 ba = {qs.x * eg0, qs.y * eg1, qs.z * eg2, qs.w * eg3};
+                                float4 bb;
+                                bb.x = __bfloat162float(__float2bfloat16(ks.x * beta_val)) * eg0;
+                                bb.y = __bfloat162float(__float2bfloat16(ks.y * beta_val)) * eg1;
+                                bb.z = __bfloat162float(__float2bfloat16(ks.z * beta_val)) * eg2;
+                                bb.w = __bfloat162float(__float2bfloat16(ks.w * beta_val)) * eg3;
+                                *reinterpret_cast<float4*>(&ww.B_a[f4_r][f4_c]) = ba;
+                                *reinterpret_cast<float4*>(&ww.B_b[f4_r][f4_c]) = bb;
+                            } else {
+                                float4 zero = {0, 0, 0, 0};
+                                *reinterpret_cast<float4*>(&ww.B_a[f4_r][f4_c]) = zero;
+                                *reinterpret_cast<float4*>(&ww.B_b[f4_r][f4_c]) = zero;
+                            }
+                        }
+                        __syncwarp();
+                        matmul_1warp_2B_transA_from_cache(
+                            dkt,
+                            smem->dAqk_cache,
+                            smem->dAkk_cache,
+                            j * BC,
+                            i_i * BC,
+                            ww.B_a,
+                            ww.B_b,
+                            gid,
+                            tid_in_grp,
+                            false,
+                            BC);
+                    }
+#pragma unroll
+                    for (int nt = 0; nt < NT; nt++) {
+                        int col0 = nt * 8 + tid_in_grp * 2;
+                        int col1 = col0 + 1;
+                        float gn0 = my_g[gn_bwd_row][col0], gn1 = my_g[gn_bwd_row][col1];
+                        float s00 = exp2f(gn0 - my_g[row0][col0]);
+                        float s01 = exp2f(gn1 - my_g[row0][col1]);
+                        float s10 = exp2f(gn0 - my_g[row1][col0]);
+                        float s11 = exp2f(gn1 - my_g[row1][col1]);
+                        dkt[nt * 4 + 0] *= s00;
+                        dkt[nt * 4 + 1] *= s01;
+                        dkt[nt * 4 + 2] *= s10;
+                        dkt[nt * 4 + 3] *= s11;
+                    }
                 }
-            }
 
-            // Build QG = q_j * exp2(g_j - gn) and KBG = k_j * beta_j * exp2(g_j - gn)
-            // (mirrors sm100 setup_intra_fused; single G/K/Q load → 2 outputs)
-            {
-                auto gQ_j = local_tile(mQ, tile_hk, make_coord(j_tile, i_k));
-                auto gK_j = local_tile(mK, tile_hk, make_coord(j_tile, i_k));
-                auto gG_j = local_tile(mG, tile_hk, make_coord(j_tile, i_k));
-                auto gBeta_j = local_tile(mBeta, Int<BC>{}, j_tile);
-                sm90_bwd_intra::setup_intra_fused_offdiag_gmem<BC, BK, NUM_THREADS>(
-                    sKG, sKBG, gQ_j, gK_j, gG_j, gBeta_j, smem.s_gn.data(), T_seq, j_ti, tid);
-            }
+                // ==================== BACKWARD DIAGONAL ====================
+                {
+                    int gn_row = min(BC / 2, sub_seq_len - 1);
+
+#pragma unroll
+                    for (int pass = 0; pass < 4; pass++) {
+                        int f4_r = pass * 4 + (tid >> 3);
+                        int f4_c = (tid & 7) << 2;
+                        if (f4_r < sub_seq_len) {
+                            float4 qs = load_bf16x4(&my_q[f4_r][f4_c]);
+                            float4 ks = load_bf16x4(&my_k[f4_r][f4_c]);
+                            float4 gs_r = *reinterpret_cast<const float4*>(&my_g[f4_r][f4_c]);
+                            float4 gs_gn = *reinterpret_cast<const float4*>(&my_g[gn_row][f4_c]);
+                            float beta_r = smem->beta_s[i_i * BC + f4_r];
+
+                            float eg0 = exp2f(gs_r.x - gs_gn.x), eg1 = exp2f(gs_r.y - gs_gn.y),
+                                  eg2 = exp2f(gs_r.z - gs_gn.z), eg3 = exp2f(gs_r.w - gs_gn.w);
+
+                            float4 ba = {qs.x * eg0, qs.y * eg1, qs.z * eg2, qs.w * eg3};
+                            float4 bb;
+                            bb.x = __bfloat162float(__float2bfloat16(ks.x * beta_r)) * eg0;
+                            bb.y = __bfloat162float(__float2bfloat16(ks.y * beta_r)) * eg1;
+                            bb.z = __bfloat162float(__float2bfloat16(ks.z * beta_r)) * eg2;
+                            bb.w = __bfloat162float(__float2bfloat16(ks.w * beta_r)) * eg3;
+                            *reinterpret_cast<float4*>(&ww.B_a[f4_r][f4_c]) = ba;
+                            *reinterpret_cast<float4*>(&ww.B_b[f4_r][f4_c]) = bb;
+                        } else {
+                            float4 zero = {0, 0, 0, 0};
+                            *reinterpret_cast<float4*>(&ww.B_a[f4_r][f4_c]) = zero;
+                            *reinterpret_cast<float4*>(&ww.B_b[f4_r][f4_c]) = zero;
+                        }
+                    }
+                    __syncwarp();
+
+                    float dktd[16] = {0};
+                    matmul_1warp_2B_transA_from_cache(
+                        dktd,
+                        smem->dAqk_cache,
+                        smem->dAkk_cache,
+                        i_i * BC,
+                        i_i * BC,
+                        ww.B_a,
+                        ww.B_b,
+                        gid,
+                        tid_in_grp,
+                        true,
+                        sub_seq_len);
+
+                    // Start epilogue loads now (B_a/B_b no longer needed by MMA)
+                    load_block_cp_async(ww.B_a, dk_base, i_i * BC, stride_qk, tile_seq_len, tid);
+                    load_block_cp_async(ww.B_b, dg_base, i_i * BC, stride_qk, tile_seq_len, tid);
+                    cp_async_commit();
+
+#pragma unroll
+                    for (int nt = 0; nt < NT; nt++) {
+                        int col0 = nt * 8 + tid_in_grp * 2;
+                        int col1 = col0 + 1;
+                        float gn0 = my_g[gn_row][col0], gn1 = my_g[gn_row][col1];
+                        float s00 = exp2f(gn0 - my_g[row0][col0]);
+                        float s01 = exp2f(gn1 - my_g[row0][col1]);
+                        float s10 = exp2f(gn0 - my_g[row1][col0]);
+                        float s11 = exp2f(gn1 - my_g[row1][col1]);
+                        dkt[nt * 4 + 0] += dktd[nt * 4 + 0] * s00;
+                        dkt[nt * 4 + 1] += dktd[nt * 4 + 1] * s01;
+                        dkt[nt * 4 + 2] += dktd[nt * 4 + 2] * s10;
+                        dkt[nt * 4 + 3] += dktd[nt * 4 + 3] * s11;
+                    }
+                }
+
+                // ==================== EPILOGUE ====================
+                cp_async_wait_all();
+                __syncwarp();
+
+                {
+                    int tile_r0 = i_i * BC + row0;
+                    int tile_r1 = i_i * BC + row1;
+
+#pragma unroll
+                    for (int nt = 0; nt < NT; nt++) {
+                        int col0 = nt * 8 + tid_in_grp * 2;
+                        if (row0 < sub_seq_len) {
+                            int off0 = tile_r0 * stride_qk + col0;
+                            __nv_bfloat162 dk_pair = {
+                                __float2bfloat16(ww.B_a[row0][col0] + dk2[nt * 4 + 0] + dkt[nt * 4 + 0]),
+                                __float2bfloat16(ww.B_a[row0][col0 + 1] + dk2[nt * 4 + 1] + dkt[nt * 4 + 1])};
+                            st_global_cg_u32(&dk_out[off0], *reinterpret_cast<uint32_t*>(&dk_pair));
+                            st_global_cg_f32x2(
+                                &dg_out[off0],
+                                dq2[nt * 4 + 0] + (dk2[nt * 4 + 0] - dkt[nt * 4 + 0]) * bf2f(my_k[row0][col0]) +
+                                    ww.B_b[row0][col0],
+                                dq2[nt * 4 + 1] + (dk2[nt * 4 + 1] - dkt[nt * 4 + 1]) * bf2f(my_k[row0][col0 + 1]) +
+                                    ww.B_b[row0][col0 + 1]);
+                        }
+                        if (row1 < sub_seq_len) {
+                            int off0 = tile_r1 * stride_qk + col0;
+                            __nv_bfloat162 dk_pair = {
+                                __float2bfloat16(ww.B_a[row1][col0] + dk2[nt * 4 + 2] + dkt[nt * 4 + 2]),
+                                __float2bfloat16(ww.B_a[row1][col0 + 1] + dk2[nt * 4 + 3] + dkt[nt * 4 + 3])};
+                            st_global_cg_u32(&dk_out[off0], *reinterpret_cast<uint32_t*>(&dk_pair));
+                            st_global_cg_f32x2(
+                                &dg_out[off0],
+                                dq2[nt * 4 + 2] + (dk2[nt * 4 + 2] - dkt[nt * 4 + 2]) * bf2f(my_k[row1][col0]) +
+                                    ww.B_b[row1][col0],
+                                dq2[nt * 4 + 3] + (dk2[nt * 4 + 3] - dkt[nt * 4 + 3]) * bf2f(my_k[row1][col0 + 1]) +
+                                    ww.B_b[row1][col0 + 1]);
+                        }
+                    }
+                }
+
+            }  // warp_active
+
             __syncthreads();
 
-            gemm_m16n32k16(smem.s_dA_qk.data(), smem.s_KG.data(), dkt_acc, tid);
-            gemm_m16n32k16(smem.s_dA_kk.data(), smem.s_KBG.data(), dkt_acc, tid);
-            __syncthreads();
-        }
+        }  // k_idx loop
 
-        // Post-multiply: dkt *= exp2(gn - g_i)
-        for (int v = 0; v < 4; ++v) {
-            int row, col;
-            get_acc_row_col(tid, v, row, col);
-            float scale = (!is_boundary || (i_ti + row) < T_seq) ? exp2f(smem.s_gn[col] - sG(row, col)) : 0.f;
-            dkt_acc[v] *= scale;
-        }
-    }
-
-    // ── Phase 2 diagonal (j == i_i, upper-triangular) ──
-    __syncthreads();
-    {
-        int mid = min(BC / 2, T_seq - i_ti - 1);
-        if (tid < BK) {
-            smem.s_gn[tid] = sG(mid, tid);
-        }
-        __syncthreads();
-
-        // Coalesced transposed loads with upper-tri mask.
-        // Only vectorize the non-boundary case; boundary needs per-element guards.
-        if (!is_boundary) {
-            constexpr int DA_VEC_ELEMS = BC * BC / 4;  // 64
-            for (int vi = tid; vi < DA_VEC_ELEMS; vi += NUM_THREADS) {
-                int r = vi / (BC / 4);
-                int c = (vi % (BC / 4)) * 4;
-                int gmem_addr = (bos + i_ti + r) * (H * BT) + i_h * BT + i_i * BC + c;
-                float4 qv = *reinterpret_cast<const float4*>(dAqk_ptr + gmem_addr);
-                float4 kv = *reinterpret_cast<const float4*>(dAkk_ptr + gmem_addr);
-                sDAqk(c + 0, r) = (c + 0 <= r) ? qv.x : 0.f;
-                sDAqk(c + 1, r) = (c + 1 <= r) ? qv.y : 0.f;
-                sDAqk(c + 2, r) = (c + 2 <= r) ? qv.z : 0.f;
-                sDAqk(c + 3, r) = (c + 3 <= r) ? qv.w : 0.f;
-                sDAkk(c + 0, r) = (c + 0 <= r) ? kv.x : 0.f;
-                sDAkk(c + 1, r) = (c + 1 <= r) ? kv.y : 0.f;
-                sDAkk(c + 2, r) = (c + 2 <= r) ? kv.z : 0.f;
-                sDAkk(c + 3, r) = (c + 3 <= r) ? kv.w : 0.f;
-            }
-        } else {
-            for (int idx = tid; idx < BC * BC; idx += NUM_THREADS) {
-                int r = idx / BC, c = idx % BC;  // r=j-row, c=i-col (contiguous in gmem)
-                bool mask = (c <= r) && (i_ti + r < T_seq) && (i_ti + c < T_seq);
-                int gmem_addr = (bos + i_ti + r) * (H * BT) + i_h * BT + i_i * BC + c;
-                sDAqk(c, r) = mask ? dAqk_ptr[gmem_addr] : 0.f;
-                sDAkk(c, r) = mask ? dAkk_ptr[gmem_addr] : 0.f;
-            }
-        }
-
-        // Build QG, KBG from persistent smem (mirrors sm100 setup_intra_fused)
-        sm90_bwd_intra::setup_intra_fused_diag<BC, BK, NUM_THREADS>(
-            sQG, sKBG, sQ, sK, sG, smem.s_beta.data(), smem.s_gn.data(), T_seq, i_ti, tid);
-        __syncthreads();
-
-        float tmp_q[4] = {0.f, 0.f, 0.f, 0.f};
-        float tmp_k[4] = {0.f, 0.f, 0.f, 0.f};
-        gemm_m16n32k16(smem.s_dA_qk.data(), smem.s_KG.data(), tmp_q, tid);
-        gemm_m16n32k16(smem.s_dA_kk.data(), smem.s_KBG.data(), tmp_k, tid);
-
-        for (int v = 0; v < 4; ++v) {
-            int row, col;
-            get_acc_row_col(tid, v, row, col);
-            bool valid = (i_ti + row) < T_seq;
-            float scale = valid ? exp2f(smem.s_gn[col] - sG(row, col)) : 0.f;
-            dkt_acc[v] += (tmp_q[v] + tmp_k[v]) * scale;
-        }
-    }
-
-    // ════════════════════════════════════════════════════════════════════════
-    // FINAL EPILOGUE: dk_out, dg_out (coalesced via smem staging)
-    // ════════════════════════════════════════════════════════════════════════
-    __syncthreads();
-    {
-        auto gDk_tile = local_tile(mDk, tile_hk, make_coord(tile_row, i_k));
-        auto gDkOut_tile = local_tile(mDkOut, tile_hk, make_coord(tile_row, i_k));
-        auto gDg_tile = local_tile(mDg, tile_hk, make_coord(tile_row, i_k));
-        auto gDgOut_tile = local_tile(mDgOut, tile_hk, make_coord(tile_row, i_k));
-        auto sStage = make_tensor(make_smem_ptr(smem.s_acc.data()), SmemLayoutAcc{});
-
-        sm90_bwd_intra::epilogue_output_dg<BC, BK, NUM_THREADS>(
-            sQ, sK, gDg_tile, gDgOut_tile, sStage, dq2_acc, dk2_acc, dkt_acc, T_seq, i_ti, is_boundary, tid);
-        __syncthreads();
-
-        sm90_bwd_intra::epilogue_output_dk<BC, BK, NUM_THREADS>(
-            gDk_tile, gDkOut_tile, sStage, dk2_acc, dkt_acc, T_seq, i_ti, tid);
-    }
+    }  // persistent while loop
 }
-
-// ============================================================
-// Host launch
-// ============================================================
-namespace sm90 {
 
 void
 run_kda_bwd_intra_sm90(KDA_bwd_intra_params& params, cudaStream_t stream) {
-    const int H = params.h;
-    const int K = params.d;
-    const int total = params.total_q_len;
+    constexpr size_t smem_size = sizeof(SmemLayout);
+    auto kernel = &kda_bwd_intra_sm90_kernel;
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
 
-    // All buffers now loaded via cp.async/cooperative in kernel (swizzled smem)
-    // TMA descriptors in params struct are unused but kept for ABI compatibility
+    int num_blocks_per_sm;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel, BLOCK_THREADS, smem_size);
 
-    // ── Launch kernel ──
-    dim3 grid = NaiveTileScheduler::get_grid_shape(params.tile_scheduler_params);
-    dim3 block(NUM_THREADS);
-    int smem_size = sizeof(SmemStorage);
+    int device;
+    cudaGetDevice(&device);
+    int num_sms;
+    cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device);
 
-    kda_bwd_intra_kernel_sm90<<<grid, block, smem_size, stream>>>(params);
+    int total_tiles = params.num_chunks * params.h;
+    int num_blocks = min(num_sms * num_blocks_per_sm, total_tiles);
+
+    int* tile_counter;
+    cudaMallocAsync(&tile_counter, sizeof(int), stream);
+    cudaMemsetAsync(tile_counter, 0, sizeof(int), stream);
+    params.tile_counter_ptr = tile_counter;
+
+    dim3 grid(num_blocks, 1, 1);
+    dim3 block(BLOCK_THREADS, 1, 1);
+    kernel<<<grid, block, smem_size, stream>>>(params);
+
+    cudaFreeAsync(tile_counter, stream);
 }
 
 }  // namespace sm90

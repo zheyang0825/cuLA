@@ -7,39 +7,77 @@
 
 struct NaiveTileScheduler {
     struct Params {
-        int num_chunks;  // total chunk tiles: sum(ceil(seq_len_i / BT))
-        int num_heads;   // H
-        int num_k;       // NK = K / BK
-        int num_c;       // NC = BT / BC
+        int num_blocks;
+        int num_heads;
+        int num_k;
+
+        int num_sm;
+        int* tile_counter;  // persistent: global atomicAdd counter (device memory, init to 0)
     };
 
+    int block_idx;
     Params params;
+    int k_idx;
+    bool is_valid_flag;
 
     CUTLASS_DEVICE
-    NaiveTileScheduler(Params const& params) : params(params) {
+    NaiveTileScheduler(Params const& params)
+        : block_idx(blockIdx.x), k_idx(blockIdx.z), params(params), is_valid_flag(true) {
     }
 
-    // Grid: x = num_k * num_c,  y = num_chunks,  z = num_heads
     static dim3
     get_grid_shape(Params const& params) {
-        return dim3(params.num_k * params.num_c, params.num_chunks, params.num_heads);
+        // Persistent: launch num_sm CTAs
+        dim3 grid(params.num_sm, 1, 1);
+        return grid;
     }
 
-    // blockIdx.x = i_k * num_c + i_i,  blockIdx.y = tile_id,  blockIdx.z = i_h
+    // Get next tile via atomicAdd (called by Load warp elected thread)
+    CUTLASS_DEVICE
+    int
+    get_next_tile_id() {
+        return atomicAdd(params.tile_counter, 1);
+    }
+
+    CUTLASS_DEVICE
+    int
+    total_tiles() const {
+        return params.num_blocks * params.num_heads;
+    }
+
+    CUTLASS_DEVICE
+    bool
+    is_valid() {
+        return is_valid_flag;
+    }
+
+    // Decode tile_id into (batch_idx, head_idx, seq_idx)
+    CUTLASS_DEVICE
+    static auto
+    decode_tile_coord(int tile_id, int num_heads, int* chunk_indices_ptr, int* cu_seqlens_ptr) {
+        using namespace cute;
+        int tile_idx_raw = tile_id / num_heads;
+        int head_idx = tile_id % num_heads;
+        int batch_idx = chunk_indices_ptr[tile_idx_raw * 2];
+        int seq_idx = chunk_indices_ptr[tile_idx_raw * 2 + 1];
+        return make_coord(batch_idx, head_idx, seq_idx, 0);
+    }
+
     CUTLASS_DEVICE
     auto
-    get_block_coord(const int* chunk_indices_ptr, const int* cu_seqlens_ptr) {
+    get_block_coord(int* chunk_indices_ptr) {
         using namespace cute;
-        const int i_kc = blockIdx.x;
-        const int tile_id = blockIdx.y;
-        const int i_h = blockIdx.z;
-        const int i_k = i_kc / params.num_c;
-        const int i_i = i_kc % params.num_c;
-        const int i_n = chunk_indices_ptr[tile_id * 2];
-        const int i_t = chunk_indices_ptr[tile_id * 2 + 1];
-        const int bos = cu_seqlens_ptr[i_n];
-        const int eos = cu_seqlens_ptr[i_n + 1];
+        int tile_idx = block_idx / params.num_heads;
+        int head_idx = block_idx % params.num_heads;
+        int batch_idx = chunk_indices_ptr[tile_idx * 2];
+        int seq_idx = chunk_indices_ptr[tile_idx * 2 + 1];
+        return make_coord(batch_idx, head_idx, seq_idx, k_idx);
+    }
 
-        return make_coord(i_n, i_h, i_t, i_k, i_i, bos, eos - bos);
+    CUTLASS_DEVICE
+    NaiveTileScheduler&
+    operator++() {
+        is_valid_flag = false;
+        return *this;
     }
 };

@@ -1,7 +1,7 @@
 # Copyright 2025-2026 Ant Group Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 
-"""CUDA/CuTe ``mma.sync`` backend for KDA intra-chunk backward.
+"""Persistent CUDA ``mma.sync`` backend for KDA intra-chunk backward.
 
 The source remains under the SM90 directory to match the current repository
 layout, but the low-level kernel is also compiled for and supported on SM100
@@ -54,17 +54,17 @@ def kda_bwd_intra_mma(
 
     cu_seqlens = cu_seqlens.to(device=q.device, dtype=torch.int32).contiguous()
     chunk_indices = chunk_indices.to(device=q.device, dtype=torch.int32).contiguous()
+    beta_fp32 = beta.float().contiguous()
     dq_out = torch.empty_like(q) if dq_out is None else dq_out
     dk_out = torch.empty_like(k) if dk_out is None else dk_out
     db_out = torch.empty_like(db, dtype=torch.float32) if db_out is None else db_out
     dg_out = torch.empty_like(dg, dtype=torch.float32) if dg_out is None else dg_out
-    db_partials = torch.empty((4, *db.shape), device=db.device, dtype=torch.float32)
 
     cula_cuda.chunk_kda_bwd_intra_cuda(
         q,
         k,
         g,
-        beta,
+        beta_fp32,
         d_aq,
         d_ak,
         dq,
@@ -75,11 +75,10 @@ def kda_bwd_intra_mma(
         chunk_indices,
         dq_out,
         dk_out,
-        db_partials,
+        db_out,
         dg_out,
         chunk_size,
     )
-    db_out.copy_(db_partials.sum(dim=0)).add_(db)
     return dq_out, dk_out, db_out, dg_out
 
 
