@@ -125,3 +125,12 @@ def test_kda_bwd_intra_support_predicate_rejects_cpu_inputs():
     tensors = _make_inputs([64], heads=1)[:10]
     cpu_tensors = tuple(tensor.cpu() for tensor in tensors)
     assert not _is_mma_bwd_intra_supported(*cpu_tensors, chunk_size=64, safe_gate=True)
+
+
+@pytest.mark.kda_fast
+def test_kda_bwd_intra_mma_rejects_empty_chunk_indices():
+    _require_supported_device()
+    inputs = list(_make_inputs([64], heads=1))
+    inputs[-1] = torch.empty((0, 2), device="cuda", dtype=torch.int32)
+    with pytest.raises(RuntimeError, match="chunk_indices must contain at least one chunk"):
+        kda_bwd_intra_mma(*inputs, chunk_size=64)

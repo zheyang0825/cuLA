@@ -126,15 +126,17 @@ ChunkKDABwdIntra(
     TORCH_CHECK(q.numel() > 0, "q must be non-empty");
     auto const total_q_len = q.size(0) * q.size(1);
     TORCH_CHECK(total_q_len <= std::numeric_limits<int>::max(), "B*T exceeds int32 range");
+    TORCH_CHECK(q.size(2) <= std::numeric_limits<int>::max(), "H exceeds int32 range");
+    TORCH_CHECK(chunk_indices.size(0) > 0, "chunk_indices must contain at least one chunk");
     TORCH_CHECK(chunk_indices.size(0) <= std::numeric_limits<int>::max(), "number of chunks exceeds int32 range");
+    TORCH_CHECK(
+        chunk_indices.size(0) <= std::numeric_limits<int>::max() / q.size(2), "num_chunks * H exceeds int32 range");
 
     c10::cuda::CUDAGuard device_guard(device);
     KDA_bwd_intra_params params{};
     params.total_q_len = static_cast<int>(total_q_len);
-    params.b = static_cast<int>(cu_seqlens.size(0) - 1);
     params.h = static_cast<int>(q.size(2));
     params.d = static_cast<int>(q.size(3));
-    params.chunk_size = static_cast<int>(chunk_size);
     params.q_ptr = q.data_ptr();
     params.k_ptr = k.data_ptr();
     params.g_ptr = g.data_ptr();
@@ -143,18 +145,16 @@ ChunkKDABwdIntra(
     params.dAkk_ptr = dAkk.data_ptr();
     params.dq_ptr = dq.data_ptr();
     params.dk_ptr = dk.data_ptr();
-    params.db_ptr = db.data_ptr();
     params.dg_ptr = dg.data_ptr();
     params.cu_seqlens_ptr = cu_seqlens.data_ptr();
     params.chunk_indices_ptr = chunk_indices.data_ptr();
     params.dq_out_ptr = dq_out.data_ptr();
     params.dk_out_ptr = dk_out.data_ptr();
-    params.db_out_ptr = db_out.data_ptr();
     params.dg_out_ptr = dg_out.data_ptr();
     params.num_chunks = static_cast<int>(chunk_indices.size(0));
-    params.num_k_tiles = params.d / 32;
 
-    auto db_partials = at::zeros({params.num_k_tiles, beta.size(0), beta.size(1), beta.size(2)}, db.options());
+    auto const num_k_tiles = q.size(3) / 32;
+    auto db_partials = at::zeros({num_k_tiles, beta.size(0), beta.size(1), beta.size(2)}, db.options());
     params.db2_ptr = db_partials.data_ptr();
 
     sm90::run_kda_bwd_intra_sm90(params, at::cuda::getCurrentCUDAStream());

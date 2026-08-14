@@ -10,10 +10,10 @@ kernel with the Triton implementation in flash-linear-attention (FLA). The
 kernel uses warp-level `mma.sync.m16n8k8`, BF16 Q/K/beta inputs, FP32 gate and
 gradient inputs, head dimension 128, and chunk size 64.
 
-Each configuration uses 25 warmup iterations and 100 measured iterations. The
-table reports the median latency. The Triton cache was cleared before each FLA
-version was measured. Variable-length cases contain eight quasi-balanced
-sequences with the indicated total token count.
+Each configuration uses `triton.testing.do_bench` with 25 ms of warmup and a
+100 ms measurement window. The table reports the median latency. The Triton
+cache was cleared before each FLA version was measured. Variable-length cases
+contain eight quasi-balanced sequences with the indicated total token count.
 
 ## FLA v0.5.0
 
@@ -54,7 +54,7 @@ The geometric-mean speedup over FLA v0.4.2 is **1.612x**.
 The SM90 correctness suite compares `dq`, `dk`, `db`, and `dg` against FLA for
 fixed-length, ragged variable-length, and dense-batch inputs. It also checks
 deterministic output, dispatcher behavior, device validation, and the
-unsupported-beta fallback. All eight tests pass on SM90.
+unsupported-beta fallback. All nine tests pass on SM90.
 
 ## Reproduction
 
