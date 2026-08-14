@@ -41,6 +41,9 @@ def _is_mma_bwd_intra_supported(
     chunk_size: int,
     safe_gate: bool,
 ) -> bool:
+    tensors = (q, k, g, beta, dAqk, dAkk, dq, dk, db, dg)
+    if not q.is_cuda or any(tensor.device != q.device for tensor in tensors[1:]):
+        return False
     capability = get_device_sm_version(q.device)
     return (
         capability in ((9, 0), (10, 0), (10, 3))

@@ -44,6 +44,8 @@ def kda_bwd_intra_mma(
     :func:`cula.kda.chunk_intra.chunk_kda_bwd_intra`.
     """
 
+    if not q.is_cuda:
+        raise ValueError("kda_bwd_intra_mma requires CUDA tensors")
     capability = get_device_sm_version(q.device)
     if capability not in _SUPPORTED_CAPABILITIES:
         raise RuntimeError(f"kda_bwd_intra_mma requires SM90, SM100, or SM103, got SM{capability[0]}{capability[1]}")

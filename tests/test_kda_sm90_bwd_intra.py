@@ -7,6 +7,7 @@ from fla.ops.kda.chunk_intra import chunk_kda_bwd_intra as fla_bwd_intra
 from fla.ops.utils import prepare_chunk_indices
 
 import cula.kda.chunk_intra as chunk_intra_module
+from cula.kda.chunk_intra import _is_mma_bwd_intra_supported
 from cula.kda.chunk_intra import chunk_kda_bwd_intra as cula_bwd_intra
 from cula.ops.kda.sm90.bwd_intra import kda_bwd_intra_mma
 
@@ -118,3 +119,9 @@ def test_kda_bwd_intra_float_beta_falls_back_to_triton(monkeypatch: pytest.Monke
 
     monkeypatch.setattr(chunk_intra_module, "_chunk_kda_bwd_intra_triton", fake_triton)
     assert cula_bwd_intra(*inputs, chunk_size=64, safe_gate=True) is sentinel
+
+
+def test_kda_bwd_intra_support_predicate_rejects_cpu_inputs():
+    tensors = _make_inputs([64], heads=1)[:10]
+    cpu_tensors = tuple(tensor.cpu() for tensor in tensors)
+    assert not _is_mma_bwd_intra_supported(*cpu_tensors, chunk_size=64, safe_gate=True)
