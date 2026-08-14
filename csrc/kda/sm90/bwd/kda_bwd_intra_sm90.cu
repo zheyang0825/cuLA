@@ -8,6 +8,8 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <c10/cuda/CUDAException.h>
+
 #include "kda/sm90/bwd/kda_config.h"
 
 namespace sm90 {
@@ -817,29 +819,30 @@ void
 run_kda_bwd_intra_sm90(KDA_bwd_intra_params& params, cudaStream_t stream) {
     constexpr size_t smem_size = sizeof(SmemLayout);
     auto kernel = &kda_bwd_intra_sm90_kernel;
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+    C10_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
     int num_blocks_per_sm;
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel, BLOCK_THREADS, smem_size);
+    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel, BLOCK_THREADS, smem_size));
 
     int device;
-    cudaGetDevice(&device);
+    C10_CUDA_CHECK(cudaGetDevice(&device));
     int num_sms;
-    cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device);
+    C10_CUDA_CHECK(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device));
 
     int total_tiles = params.num_chunks * params.h;
     int num_blocks = min(num_sms * num_blocks_per_sm, total_tiles);
 
     int* tile_counter;
-    cudaMallocAsync(&tile_counter, sizeof(int), stream);
-    cudaMemsetAsync(tile_counter, 0, sizeof(int), stream);
+    C10_CUDA_CHECK(cudaMallocAsync(&tile_counter, sizeof(int), stream));
+    C10_CUDA_CHECK(cudaMemsetAsync(tile_counter, 0, sizeof(int), stream));
     params.tile_counter_ptr = tile_counter;
 
     dim3 grid(num_blocks, 1, 1);
     dim3 block(BLOCK_THREADS, 1, 1);
     kernel<<<grid, block, smem_size, stream>>>(params);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-    cudaFreeAsync(tile_counter, stream);
+    C10_CUDA_CHECK(cudaFreeAsync(tile_counter, stream));
 }
 
 }  // namespace sm90

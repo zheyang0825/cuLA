@@ -158,6 +158,5 @@ ChunkKDABwdIntra(
     params.db2_ptr = db_partials.data_ptr();
 
     sm90::run_kda_bwd_intra_sm90(params, at::cuda::getCurrentCUDAStream());
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
     db_out.copy_(db_partials.sum(0).add_(db));
 }
