@@ -162,7 +162,7 @@ See [BENCHMARK_H200.md](BENCHMARK_H200.md) for CuTe DSL FlashKDA results on an H
 
 **Portable SM90-style MMA (SM90 / SM100)**
 
-See [BENCHMARK_KDA_BWD_INTRA_SM90.md](BENCHMARK_KDA_BWD_INTRA_SM90.md) for the persistent CUDA C++ KDA intra-chunk backward benchmark.
+See [BENCHMARK_KDA_BWD_INTRA.md](BENCHMARK_KDA_BWD_INTRA.md) for the persistent CUDA C++ KDA intra-chunk backward benchmark.
 
 **Highlights:**
 - **KDA Modular Forward (Blackwell):** **avg 1.33x** speedup on fixed-length, **avg 1.35x** on variable-length (18 configs, uniform/skewed/random).
