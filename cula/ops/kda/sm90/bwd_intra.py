@@ -37,7 +37,7 @@ def kda_bwd_intra_mma(
     dg_out: torch.Tensor | None = None,
     chunk_size: int = _CHUNK_SIZE,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run the portable SM90-style MMA kernel directly.
+    """Run the persistent CUDA MMA kernel directly.
 
     This is the low-level validation/benchmark entry point. Unsupported
     production cases are handled by the higher-level Triton fallback in

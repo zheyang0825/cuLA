@@ -160,7 +160,7 @@ See [BENCHMARK_GB200_CUDA_130.md](BENCHMARK_GB200_CUDA_130.md) tested with CUDA 
 
 See [BENCHMARK_H200.md](BENCHMARK_H200.md) for CuTe DSL FlashKDA results on an H200 141GB with CUDA 12.9.
 
-**Portable SM90-style MMA (SM90 / SM100)**
+**KDA Backward Intra CUDA (SM90 / SM100)**
 
 See [BENCHMARK_KDA_BWD_INTRA.md](BENCHMARK_KDA_BWD_INTRA.md) for the persistent CUDA C++ KDA intra-chunk backward benchmark.
 
@@ -185,7 +185,7 @@ python benchmarks/bench_la_decode_vs_fla.py --heads 64 --head-dim 128
 python benchmarks/bench_kda_sm90_prefill.py --mode both
 python benchmarks/bench_kda_sm90_cp.py
 
-# Portable SM90-style MMA kernel (SM90 / SM100)
+# KDA backward intra CUDA kernel (SM90 / SM100)
 python benchmarks/bench_kda_bwd_intra_sm90.py --heads 32 64
 ```
 
@@ -198,7 +198,7 @@ python -m pytest tests/test_kda_sm100_chunk_vs_fla.py -v
 python -m pytest tests/test_kda_sm100_chunk_vs_naive.py -v
 # Tests for the SM90 CuTeDSL two-kernel prefill + intracard CP (vs FLA)
 python -m pytest tests/test_kda_sm90_prefill_vs_fla.py tests/test_kda_sm90_intracard_cp.py -v
-# Tests for the persistent SM90-style KDA intra-chunk backward kernel (vs FLA)
+# Tests for the persistent KDA intra-chunk backward CUDA kernel (vs FLA)
 python -m pytest tests/test_kda_sm90_bwd_intra.py -v
 # Tests for Lightning Attention prefill on SM100
 python tests/test_lightning_sm100_prefill.py
